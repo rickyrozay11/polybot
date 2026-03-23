@@ -101,6 +101,9 @@ export type AgentActionType =
   | "position_refresh"
   | "copy_trade_scan"
   | "copy_trade_execute"
+  | "whale_alert"
+  | "convergence_signal"
+  | "ensemble_vote"
   | "error";
 
 // --- Copy-Trading Types ---
@@ -220,6 +223,7 @@ export interface AgentConfig {
   maxTotalExposure: number;
   minConfidence: number;
   modelId: string;
+  ensembleModels?: string[];
   runIntervalMinutes: number;
   enabled: boolean;
   dryRun: boolean;
@@ -231,8 +235,107 @@ export const DEFAULT_CONFIG: AgentConfig = {
   maxTotalExposure: 500,
   minConfidence: 0.6,
   modelId: "x-ai/grok-4.20-multi-agent-beta",
+  ensembleModels: [
+    "x-ai/grok-4.20-multi-agent-beta",
+    "anthropic/claude-opus-4-6",
+    "openai/gpt-5.4",
+    "deepseek/deepseek-v3.2",
+  ],
   runIntervalMinutes: 15,
   enabled: true,
   dryRun: true,
   availableBalance: 500,
 };
+
+// --- Ensemble Types ---
+
+export interface EnsembleVote {
+  modelId: string;
+  response: LLMResponse;
+  latencyMs: number;
+  parsedAction?: string;
+  parsedConfidence?: number;
+}
+
+export interface EnsembleResult {
+  votes: EnsembleVote[];
+  consensus: {
+    action: "buy_yes" | "buy_no" | "skip";
+    confidence: number;
+    agreementLevel: "full" | "majority" | "weak" | "none";
+    voteCounts: Record<string, number>;
+  };
+}
+
+// --- Whale Tracking Types ---
+
+export interface WhaleTradeAlert {
+  traderAddress: string;
+  conditionId: string;
+  question: string;
+  tokenId: string;
+  side: "buy_yes" | "buy_no";
+  size: number;
+  price: number;
+  timestamp: number;
+  totalValue: number;
+  isInsider: boolean;
+  marketSlug?: string;
+}
+
+export interface VolumeSpike {
+  conditionId: string;
+  question: string;
+  normalVolume: number;
+  currentVolume: number;
+  spikeMultiplier: number;
+  timestamp: number;
+  direction: "bullish" | "bearish" | "mixed";
+}
+
+// --- Convergence Trading Types ---
+
+export interface ConvergenceSignal {
+  conditionId: string;
+  question: string;
+  tokenId: string;
+  side: "buy_yes" | "buy_no";
+  confidence: number;
+  reasoning: string;
+  cexPrice: number;
+  polymarketPrice: number;
+  expectedPolyPrice: number;
+  priceLagPercent: number;
+  suggestedSize: number;
+  exchange: string;
+  symbol: string;
+}
+
+export interface CryptoMarketMapping {
+  symbol: string;
+  conditionId: string;
+  question: string;
+  tokenId: string;
+  threshold: number;
+  direction: "above" | "below";
+}
+
+// --- WebSocket Types ---
+
+export interface PriceUpdate {
+  tokenId: string;
+  oldPrice: number;
+  newPrice: number;
+  timestamp: number;
+  volume?: number;
+}
+
+export interface WSTradeEvent {
+  tokenId: string;
+  side: string;
+  size: number;
+  price: number;
+  timestamp: number;
+  maker?: string;
+  taker?: string;
+}

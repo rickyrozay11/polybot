@@ -9,6 +9,11 @@ const logActionArgs = {
     v.literal("research"),
     v.literal("trade"),
     v.literal("position_refresh"),
+    v.literal("copy_trade_scan"),
+    v.literal("copy_trade_execute"),
+    v.literal("whale_alert"),
+    v.literal("convergence_signal"),
+    v.literal("ensemble_vote"),
     v.literal("error")
   ),
   summary: v.string(),
@@ -145,5 +150,101 @@ export const cycleStats = query({
       totalSkips,
       totalErrors,
     };
+  },
+});
+
+// --- Internal mutations for writing to new tables ---
+
+export const internalRecordEnsembleVote = internalMutation({
+  args: {
+    cycleId: v.string(),
+    conditionId: v.string(),
+    question: v.string(),
+    votes: v.array(v.object({
+      modelId: v.string(),
+      action: v.union(v.literal("buy_yes"), v.literal("buy_no"), v.literal("skip")),
+      confidence: v.float64(),
+      reasoning: v.string(),
+      latencyMs: v.float64(),
+    })),
+    consensusAction: v.union(v.literal("buy_yes"), v.literal("buy_no"), v.literal("skip")),
+    consensusConfidence: v.float64(),
+    agreementLevel: v.union(v.literal("full"), v.literal("majority"), v.literal("weak"), v.literal("none")),
+    modelWeights: v.optional(v.any()),
+    createdAt: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    return await ctx.db.insert("ensembleVotes", args);
+  },
+});
+
+export const internalRecordWhaleAlert = internalMutation({
+  args: {
+    traderAddress: v.string(),
+    conditionId: v.string(),
+    question: v.string(),
+    tokenId: v.string(),
+    side: v.union(v.literal("buy_yes"), v.literal("buy_no")),
+    size: v.float64(),
+    price: v.float64(),
+    totalValue: v.float64(),
+    isInsider: v.boolean(),
+    marketSlug: v.optional(v.string()),
+    detectedAt: v.float64(),
+    actedOn: v.boolean(),
+    actionTaken: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    return await ctx.db.insert("whaleAlerts", args);
+  },
+});
+
+export const internalRecordConvergenceSignal = internalMutation({
+  args: {
+    conditionId: v.string(),
+    question: v.string(),
+    tokenId: v.string(),
+    side: v.union(v.literal("buy_yes"), v.literal("buy_no")),
+    exchange: v.string(),
+    symbol: v.string(),
+    cexPrice: v.float64(),
+    polymarketPrice: v.float64(),
+    expectedPolyPrice: v.float64(),
+    priceLagPercent: v.float64(),
+    confidence: v.float64(),
+    suggestedSize: v.float64(),
+    reasoning: v.string(),
+    status: v.union(v.literal("pending"), v.literal("executed"), v.literal("expired"), v.literal("skipped")),
+    detectedAt: v.float64(),
+    executedAt: v.optional(v.float64()),
+  },
+  handler: async (ctx, args) => {
+    return await ctx.db.insert("convergenceSignals", args);
+  },
+});
+
+// --- Ensemble vote queries for the bot simulator ---
+
+export const listEnsembleVotes = query({
+  args: { limit: v.optional(v.float64()) },
+  handler: async (ctx, args) => {
+    const q = ctx.db.query("ensembleVotes").order("desc");
+    return args.limit ? await q.take(args.limit) : await q.collect();
+  },
+});
+
+export const listWhaleAlerts = query({
+  args: { limit: v.optional(v.float64()) },
+  handler: async (ctx, args) => {
+    const q = ctx.db.query("whaleAlerts").order("desc");
+    return args.limit ? await q.take(args.limit) : await q.collect();
+  },
+});
+
+export const listConvergenceSignals = query({
+  args: { limit: v.optional(v.float64()) },
+  handler: async (ctx, args) => {
+    const q = ctx.db.query("convergenceSignals").order("desc");
+    return args.limit ? await q.take(args.limit) : await q.collect();
   },
 });

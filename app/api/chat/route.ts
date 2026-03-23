@@ -10,6 +10,30 @@ const openrouter = createOpenAICompatible({
   baseURL: "https://openrouter.ai/api/v1",
 });
 
+// Multi-model chat routing
+const FAST_MODEL = "x-ai/grok-4.20-beta";
+const HEAVY_MODEL = "anthropic/claude-opus-4-6";
+
+function classifyComplexity(message: string): "fast" | "heavy" {
+  const lower = message.toLowerCase();
+  const fastPatterns = [
+    /\bprice\b/, /\btrending\b/, /\bleaderboard\b/, /\bhow much\b/,
+    /\bwhat is\b.*\btrading\b/, /\bget\b.*\bmarket/, /\bshow\b.*\bmarket/,
+    /\blist\b/, /\btop\b.*\bmarkets/, /\borderbook\b/, /\bmidpoint\b/,
+  ];
+  const heavyPatterns = [
+    /\bshould i\b/, /\banalyze\b/, /\banalysis\b/, /\bstrategy\b/,
+    /\bwhy\b.*\b(price|market|odds)\b/, /\bcompare\b/, /\bexplain\b/,
+    /\bsentiment\b/, /\brisk\b/, /\bportfolio\b/, /\bthink\b/,
+    /\bpredict\b/, /\bforecast\b/, /\bedge\b/, /\bmispriced\b/,
+    /\bcopy.?trad/, /\bwhale\b/, /\binsider\b/,
+  ];
+
+  if (heavyPatterns.some(p => p.test(lower))) return "heavy";
+  if (fastPatterns.some(p => p.test(lower))) return "fast";
+  return message.split(/\s+/).length > 20 ? "heavy" : "fast";
+}
+
 // ---- Polymarket API helpers ----
 
 const GAMMA_API = "https://gamma-api.polymarket.com";
@@ -37,9 +61,27 @@ export async function POST(req: Request) {
   try {
   const { messages }: { messages: UIMessage[] } = await req.json();
 
+  // Determine which model to use based on message complexity
+  const lastMessage = messages[messages.length - 1];
+  let lastMessageText = '';
+  if (lastMessage) {
+    if (typeof lastMessage === 'string') {
+      lastMessageText = lastMessage;
+    } else if (typeof lastMessage === 'object' && lastMessage.parts) {
+      lastMessageText = (lastMessage.parts as any[])
+        .map((p: any) => (typeof p === 'string' ? p : p.text || ''))
+        .join(' ');
+    } else if (typeof lastMessage === 'object' && (lastMessage as any).text) {
+      lastMessageText = (lastMessage as any).text;
+    }
+  }
+  const complexity = classifyComplexity(lastMessageText);
+  const selectedModel = complexity === "heavy" ? HEAVY_MODEL : FAST_MODEL;
+  console.log(`[chat] Routing to ${complexity} model: ${selectedModel}`);
+
   const result = streamText({
-    model: openrouter("x-ai/grok-4.20-beta"),
-    system: `You are Grok 4.20 Multi-Agent, a Polymarket copy-trading assistant with LIVE access to Polymarket APIs.
+    model: openrouter(selectedModel),
+    system: `You are a Polymarket copy-trading assistant with LIVE access to Polymarket APIs. You are currently running as ${selectedModel} in ${complexity} mode.
 
 You have tools to fetch real-time data:
 - get_trending_markets: Get the hottest markets right now (volume, prices, liquidity)

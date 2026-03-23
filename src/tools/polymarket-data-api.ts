@@ -117,7 +117,7 @@ export async function fetchTraderActivity(
 ): Promise<TraderActivityItem[]> {
   return withRetry(
     async () => {
-      const url = `${DATA_API_BASE}/activity?address=${address}&limit=${limit}`;
+      const url = `${DATA_API_BASE}/activity?user=${address}&limit=${limit}`;
       const res = await fetch(url, {
         headers: { Accept: "application/json" },
       });
@@ -149,7 +149,7 @@ export async function fetchTraderActivity(
 export async function fetchTraderPositions(address: string): Promise<TraderPosition[]> {
   return withRetry(
     async () => {
-      const url = `${DATA_API_BASE}/positions?address=${address}`;
+      const url = `${DATA_API_BASE}/positions?user=${address}`;
       const res = await fetch(url, {
         headers: { Accept: "application/json" },
       });

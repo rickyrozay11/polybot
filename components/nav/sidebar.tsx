@@ -14,6 +14,7 @@ import {
   MessageSquare,
   Activity,
   Users,
+  Zap,
 } from "lucide-react";
 import { cn } from "@/src/lib/utils";
 
@@ -24,6 +25,7 @@ const links = [
   { href: "/copy-trade", label: "Copy Trade", icon: Users },
   { href: "/activity", label: "Activity", icon: Activity },
   { href: "/chat", label: "Chat", icon: MessageSquare },
+  { href: "/simulator", label: "Bot Simulator", icon: Zap },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 
