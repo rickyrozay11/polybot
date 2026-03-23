@@ -114,6 +114,12 @@ export const runAgentCycle = internalAction({
         modelId: config.modelId,
       });
 
+      // Tool-capable LLM for research stage (grok multi-agent doesn't support tool calling)
+      const toolLlm = new OpenRouterProvider({
+        apiKey: process.env.OPENROUTER_API_KEY!,
+        modelId: "anthropic/claude-opus-4-6",
+      });
+
       // Set up ensemble provider for trade decision validation
       const ensembleModelIds = [
         "x-ai/grok-4.20-multi-agent-beta",
@@ -148,6 +154,7 @@ export const runAgentCycle = internalAction({
 
       await runPipeline({
         llm,
+        toolLlm,
         scanner: { fetchTrendingMarkets },
         polyClient,
         toolDeps: {},

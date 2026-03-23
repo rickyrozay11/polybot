@@ -19,6 +19,8 @@ import {
 
 export interface PipelineDeps {
   llm: LLMProvider;
+  /** LLM provider that supports tool calling (used for research stage). Falls back to `llm` if not set. */
+  toolLlm?: LLMProvider;
   scanner: {
     fetchTrendingMarkets: (limit?: number) => Promise<MarketCandidate[]>;
   };
@@ -384,6 +386,9 @@ async function runResearchLoop(
   market: MarketCandidate,
   candidate: ScreeningResult
 ): Promise<string> {
+  // Use tool-capable LLM for research (falls back to default llm)
+  const researchLlm = deps.toolLlm ?? deps.llm;
+
   // Dynamically import tool registry (may not exist yet during development)
   let getToolDefinitions: () => LLMToolDefinition[];
   let executeToolCall: (
@@ -398,7 +403,7 @@ async function runResearchLoop(
     executeToolCall = toolRegistry.executeToolCall;
   } catch {
     // If tool registry not available, do a single-shot research synthesis
-    const response = await deps.llm.chat({
+    const response = await researchLlm.chat({
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         {
@@ -434,7 +439,7 @@ async function runResearchLoop(
 
   const MAX_ITERATIONS = 2;
   for (let i = 0; i < MAX_ITERATIONS; i++) {
-    const response = await deps.llm.chat({
+    const response = await researchLlm.chat({
       messages,
       tools,
       temperature: 0.4,
