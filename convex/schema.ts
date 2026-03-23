@@ -56,10 +56,40 @@ export default defineSchema({
     lastUpdated: v.float64(),
     source: v.union(v.literal("leaderboard"), v.literal("whale"), v.literal("manual")),
     enabled: v.boolean(),
+    // --- Enhanced scoring fields ---
+    roi: v.optional(v.float64()), // profit / volume (capital efficiency)
+    realWinRate: v.optional(v.float64()), // actual wins / total trades from history
+    consistency: v.optional(v.float64()), // Sharpe-like: mean(returns) / stddev(returns)
+    copyPnl: v.optional(v.float64()), // YOUR realized P&L from copying this trader
+    copyTradeCount: v.optional(v.float64()), // how many times you've copied them
+    copyWinCount: v.optional(v.float64()), // how many copy trades were profitable
+    decayedScore: v.optional(v.float64()), // composite score with exponential time decay
+    avgHoldTime: v.optional(v.float64()), // avg time between entry and exit (ms)
+    lastTradeAt: v.optional(v.float64()), // when the trader last traded
+    disabledReason: v.optional(v.string()), // why auto-disabled (e.g. "underperformer")
   })
     .index("by_address", ["address"])
     .index("by_compositeScore", ["compositeScore"])
-    .index("by_enabled", ["enabled"]),
+    .index("by_enabled", ["enabled"])
+    .index("by_decayedScore", ["decayedScore"]),
+
+  traderPerformance: defineTable({
+    traderAddress: v.string(),
+    conditionId: v.string(),
+    question: v.string(),
+    side: v.union(v.literal("buy_yes"), v.literal("buy_no")),
+    copySize: v.float64(),
+    copyPrice: v.float64(),
+    exitPrice: v.optional(v.float64()),
+    pnl: v.optional(v.float64()),
+    status: v.union(v.literal("open"), v.literal("closed"), v.literal("resolved")),
+    openedAt: v.float64(),
+    closedAt: v.optional(v.float64()),
+  })
+    .index("by_traderAddress", ["traderAddress"])
+    .index("by_status", ["status"])
+    .index("by_conditionId", ["conditionId"])
+    .index("by_openedAt", ["openedAt"]),
 
   traderActivity: defineTable({
     traderAddress: v.string(),

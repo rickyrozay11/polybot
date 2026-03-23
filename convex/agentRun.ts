@@ -443,7 +443,7 @@ export const runCopyTradeCycle = internalAction({
     });
 
     try {
-      const { discoverTopTraders, scanTraderActivity, generateCopySignals, buildCopyTradeValidationPrompt } =
+      const { discoverTopTraders, scanTraderActivity, generateCopySignals, buildCopyTradeValidationPrompt, shouldDisableTrader } =
         await import("../src/agent/copy-trader");
       const { OpenRouterProvider } = await import("../src/llm/openrouter");
       const { SYSTEM_PROMPT } = await import("../src/agent/prompts");
@@ -489,17 +489,25 @@ export const runCopyTradeCycle = internalAction({
             compositeScore: trader.compositeScore,
             source: "leaderboard",
             enabled: true,
+            roi: trader.roi,
+            realWinRate: trader.realWinRate,
+            consistency: trader.consistency,
+            decayedScore: trader.decayedScore,
+            lastTradeAt: trader.lastTradeAt,
           });
         }
 
         await ctx.runMutation(internal.agentActions.internalLogAction, {
           type: "copy_trade_scan",
-          summary: `Discovered ${topTraders.length} top traders from leaderboard`,
+          summary: `Discovered ${topTraders.length} top traders (ROI-scored)`,
           details: {
             cycleId,
             traders: topTraders.slice(0, 5).map((t) => ({
               username: t.username,
               score: t.compositeScore,
+              decayed: t.decayedScore,
+              roi: t.roi,
+              realWinRate: t.realWinRate,
               pnl: t.pnl,
             })),
           },
@@ -846,6 +854,19 @@ export const runCopyTradeCycle = internalAction({
           status: "executed",
         });
 
+        // --- Per-trader P&L attribution ---
+        await ctx.runMutation(internal.trackedTraders.internalRecordCopyResult, {
+          traderAddress: signal.traderAddress,
+          conditionId: signal.conditionId,
+          question: signal.question,
+          side: signal.side,
+          copySize: finalSize,
+          copyPrice: signal.price,
+        });
+        await ctx.runMutation(internal.trackedTraders.internalIncrementCopyCount, {
+          address: signal.traderAddress,
+        });
+
         executedCount++;
       }
 
@@ -861,6 +882,29 @@ export const runCopyTradeCycle = internalAction({
         timestamp: Date.now(),
         cycleId,
       });
+
+      // --- Auto-disable underperforming traders ---
+      const allTracked = await ctx.runQuery(internal.trackedTraders.internalEnabledTraders, {});
+      let disabledCount = 0;
+      for (const trader of allTracked) {
+        const reason = shouldDisableTrader(trader as any);
+        if (reason) {
+          await ctx.runMutation(internal.trackedTraders.internalAutoDisableTrader, {
+            address: trader.address,
+            reason,
+          });
+          disabledCount++;
+        }
+      }
+      if (disabledCount > 0) {
+        await ctx.runMutation(internal.agentActions.internalLogAction, {
+          type: "copy_trade_scan",
+          summary: `Auto-disabled ${disabledCount} underperforming trader(s)`,
+          details: { cycleId, disabledCount },
+          timestamp: Date.now(),
+          cycleId,
+        });
+      }
 
       // Reconcile wallet
       const finalPositions = await ctx.runQuery(internal.positions.internalOpenPositions, {});
@@ -903,17 +947,25 @@ export const refreshTrackedTraders = internalAction({
           compositeScore: trader.compositeScore,
           source: "leaderboard",
           enabled: true,
+          roi: trader.roi,
+          realWinRate: trader.realWinRate,
+          consistency: trader.consistency,
+          decayedScore: trader.decayedScore,
+          lastTradeAt: trader.lastTradeAt,
         });
       }
 
       await ctx.runMutation(internal.agentActions.internalLogAction, {
         type: "copy_trade_scan",
-        summary: `Refreshed ${topTraders.length} tracked traders from leaderboard`,
+        summary: `Refreshed ${topTraders.length} tracked traders (ROI-scored)`,
         details: {
           count: topTraders.length,
           top5: topTraders.slice(0, 5).map((t) => ({
             username: t.username,
             score: t.compositeScore,
+            decayed: t.decayedScore,
+            roi: t.roi,
+            realWinRate: t.realWinRate,
             pnl: t.pnl,
           })),
         },

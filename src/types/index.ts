@@ -117,6 +117,31 @@ export interface TrackedTrader {
   tradeCount: number;
   compositeScore: number;
   lastUpdated: number;
+  // Enhanced scoring
+  roi?: number;
+  realWinRate?: number;
+  consistency?: number;
+  copyPnl?: number;
+  copyTradeCount?: number;
+  copyWinCount?: number;
+  decayedScore?: number;
+  avgHoldTime?: number;
+  lastTradeAt?: number;
+  disabledReason?: string;
+}
+
+export interface TraderPerformance {
+  traderAddress: string;
+  conditionId: string;
+  question: string;
+  side: "buy_yes" | "buy_no";
+  copySize: number;
+  copyPrice: number;
+  exitPrice?: number;
+  pnl?: number;
+  status: "open" | "closed" | "resolved";
+  openedAt: number;
+  closedAt?: number;
 }
 
 export interface TraderPosition {
