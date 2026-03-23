@@ -100,7 +100,7 @@ export const runAgentCycle = internalAction({
         minConfidence: minConfidenceEntry
           ? parseFloat(minConfidenceEntry.value)
           : 0.6,
-        modelId: modelEntry?.value ?? "x-ai/grok-4.1-fast",
+        modelId: modelEntry?.value ?? "x-ai/grok-4.20-multi-agent-beta",
         runIntervalMinutes: 15,
         enabled: true,
         dryRun: dryRunEntry ? dryRunEntry.value === "true" : true,
@@ -266,6 +266,433 @@ export const runAgentCycle = internalAction({
         details: { cycleId, error: message },
         timestamp: Date.now(),
         cycleId,
+      });
+    }
+  },
+});
+
+// ============================================================
+// Copy-Trading Cycle
+// ============================================================
+
+export const runCopyTradeCycle = internalAction({
+  args: {},
+  handler: async (ctx) => {
+    // Check if agent is enabled
+    const enabledEntry = await ctx.runQuery(
+      internal.config.internalGetConfig,
+      { key: "enabled" }
+    );
+    if (enabledEntry?.value !== "true") return;
+
+    // Check wallet
+    const wallet = await ctx.runQuery(internal.wallet.internalGetWallet);
+    if (!wallet || wallet.balance < 0.5) return;
+
+    const cycleId = `copy-${Date.now()}`;
+
+    await ctx.runMutation(internal.agentActions.internalLogAction, {
+      type: "copy_trade_scan",
+      summary: `Copy-trade scan started: ${cycleId}`,
+      details: { cycleId, balance: wallet.balance },
+      timestamp: Date.now(),
+      cycleId,
+    });
+
+    try {
+      const { discoverTopTraders, scanTraderActivity, generateCopySignals, buildCopyTradeValidationPrompt } =
+        await import("../src/agent/copy-trader");
+      const { OpenRouterProvider } = await import("../src/llm/openrouter");
+      const { SYSTEM_PROMPT } = await import("../src/agent/prompts");
+
+      // Read config
+      const modelEntry = await ctx.runQuery(internal.config.internalGetConfig, { key: "modelId" });
+      const maxTradeSizeEntry = await ctx.runQuery(internal.config.internalGetConfig, { key: "maxTradeSize" });
+      const maxExposureEntry = await ctx.runQuery(internal.config.internalGetConfig, { key: "maxTotalExposure" });
+      const minConfidenceEntry = await ctx.runQuery(internal.config.internalGetConfig, { key: "minConfidence" });
+      const dryRunEntry = await ctx.runQuery(internal.config.internalGetConfig, { key: "dryRun" });
+
+      const config = {
+        maxTradeSize: maxTradeSizeEntry ? parseFloat(maxTradeSizeEntry.value) : 25,
+        maxTotalExposure: maxExposureEntry ? parseFloat(maxExposureEntry.value) : 500,
+        minConfidence: minConfidenceEntry ? parseFloat(minConfidenceEntry.value) : 0.6,
+        modelId: modelEntry?.value ?? "x-ai/grok-4.20-multi-agent-beta",
+        runIntervalMinutes: 15,
+        enabled: true,
+        dryRun: dryRunEntry ? dryRunEntry.value === "true" : true,
+        availableBalance: wallet.balance,
+      };
+
+      const llm = new OpenRouterProvider({
+        apiKey: process.env.OPENROUTER_API_KEY!,
+        modelId: config.modelId,
+      });
+
+      // Step 1: Get or refresh tracked traders
+      let trackedTraders = await ctx.runQuery(internal.trackedTraders.internalEnabledTraders, {});
+
+      // Refresh from leaderboard every cycle (or if no traders tracked yet)
+      if (trackedTraders.length < 5) {
+        const topTraders = await discoverTopTraders(20);
+
+        for (const trader of topTraders) {
+          await ctx.runMutation(internal.trackedTraders.internalUpsertTrader, {
+            address: trader.address,
+            username: trader.username,
+            pnl: trader.pnl,
+            volume: trader.volume,
+            winRate: trader.winRate,
+            tradeCount: trader.tradeCount,
+            compositeScore: trader.compositeScore,
+            source: "leaderboard",
+            enabled: true,
+          });
+        }
+
+        await ctx.runMutation(internal.agentActions.internalLogAction, {
+          type: "copy_trade_scan",
+          summary: `Discovered ${topTraders.length} top traders from leaderboard`,
+          details: {
+            cycleId,
+            traders: topTraders.slice(0, 5).map((t) => ({
+              username: t.username,
+              score: t.compositeScore,
+              pnl: t.pnl,
+            })),
+          },
+          timestamp: Date.now(),
+          cycleId,
+        });
+
+        // Re-fetch from DB
+        trackedTraders = await ctx.runQuery(internal.trackedTraders.internalEnabledTraders, {});
+      }
+
+      if (trackedTraders.length === 0) {
+        await ctx.runMutation(internal.agentActions.internalLogAction, {
+          type: "copy_trade_scan",
+          summary: "No tracked traders found — skipping copy-trade cycle",
+          details: { cycleId },
+          timestamp: Date.now(),
+          cycleId,
+        });
+        return;
+      }
+
+      // Step 2: Scan for new activity (last 20 minutes to overlap with cron interval)
+      const sinceTimestamp = Date.now() - 20 * 60 * 1000;
+      const tradersForScan = trackedTraders.map((t) => ({
+        address: t.address,
+        username: t.username,
+        pnl: t.pnl,
+        volume: t.volume,
+        winRate: t.winRate,
+        tradeCount: t.tradeCount,
+        compositeScore: t.compositeScore,
+        lastUpdated: t.lastUpdated,
+      }));
+
+      const detections = await scanTraderActivity(tradersForScan, sinceTimestamp);
+
+      if (detections.length === 0) {
+        await ctx.runMutation(internal.agentActions.internalLogAction, {
+          type: "copy_trade_scan",
+          summary: `No new trades detected from ${trackedTraders.length} tracked traders`,
+          details: { cycleId, tradersScanned: trackedTraders.length },
+          timestamp: Date.now(),
+          cycleId,
+        });
+        return;
+      }
+
+      // Log detected activity
+      const totalNewTrades = detections.reduce((s, d) => s + d.trades.length, 0);
+      await ctx.runMutation(internal.agentActions.internalLogAction, {
+        type: "copy_trade_scan",
+        summary: `Detected ${totalNewTrades} new trades from ${detections.length} traders`,
+        details: {
+          cycleId,
+          detections: detections.map((d) => ({
+            trader: d.traderUsername,
+            tradeCount: d.trades.length,
+          })),
+        },
+        timestamp: Date.now(),
+        cycleId,
+      });
+
+      // Log individual trader activity
+      for (const detection of detections) {
+        for (const trade of detection.trades) {
+          const side: "buy_yes" | "buy_no" =
+            trade.side === "BUY"
+              ? trade.outcome?.toLowerCase() === "no" ? "buy_no" : "buy_yes"
+              : trade.outcome?.toLowerCase() === "no" ? "buy_yes" : "buy_no";
+
+          await ctx.runMutation(internal.trackedTraders.internalLogTraderActivity, {
+            traderAddress: detection.traderAddress,
+            conditionId: trade.conditionId,
+            question: trade.title ?? trade.conditionId,
+            tokenId: trade.asset,
+            side,
+            size: parseFloat(trade.size),
+            price: parseFloat(trade.price),
+            copied: false,
+          });
+        }
+      }
+
+      // Step 3: Generate consensus signals
+      const openPositions = await ctx.runQuery(internal.positions.internalOpenPositions, {});
+      const existingPositionIds = openPositions.map((p: any) => p.conditionId);
+
+      const signals = await generateCopySignals(detections, config, existingPositionIds);
+
+      if (signals.length === 0) {
+        await ctx.runMutation(internal.agentActions.internalLogAction, {
+          type: "copy_trade_scan",
+          summary: "No consensus signals generated (insufficient trader agreement)",
+          details: { cycleId },
+          timestamp: Date.now(),
+          cycleId,
+        });
+        return;
+      }
+
+      // Step 4: LLM validation with Grok 4.20
+      const validationPrompt = buildCopyTradeValidationPrompt(signals);
+      const validationResponse = await llm.chat({
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: validationPrompt },
+        ],
+        temperature: 0.2,
+        response_format: { type: "json_object" },
+      });
+
+      let validations: Array<{
+        index: number;
+        approved: boolean;
+        adjustedSize?: number;
+        confidence?: number;
+        reasoning?: string;
+      }> = [];
+
+      try {
+        const parsed = JSON.parse(validationResponse.content ?? "{}");
+        validations = parsed.validations ?? parsed.data ?? parsed.results ?? [];
+      } catch {
+        // If parsing fails, skip validation and approve all with default confidence
+        validations = signals.map((_, i) => ({
+          index: i + 1,
+          approved: true,
+          confidence: 0.6,
+          reasoning: "LLM validation parse failed, using default approval",
+        }));
+      }
+
+      // Step 5: Execute approved signals
+      let executedCount = 0;
+      let cycleBalance = wallet.balance;
+
+      for (let i = 0; i < signals.length; i++) {
+        const signal = signals[i];
+        const validation = validations.find((v) => v.index === i + 1);
+
+        // Record the signal
+        const signalId = await ctx.runMutation(internal.trackedTraders.internalRecordSignal, {
+          conditionId: signal.conditionId,
+          question: signal.question,
+          tokenId: signal.tokenId,
+          side: signal.side,
+          traderCount: new Set(detections.map((d) => d.traderAddress)).size,
+          consensus: signal.consensus,
+          avgTraderScore: signal.traderScore,
+          suggestedSize: signal.suggestedSize,
+          price: signal.price,
+          status: "pending",
+          reasoning: signal.reasoning,
+        });
+
+        if (!validation?.approved) {
+          await ctx.runMutation(internal.trackedTraders.internalUpdateSignalStatus, {
+            signalId,
+            status: "skipped",
+          });
+          continue;
+        }
+
+        const finalSize = Math.min(
+          validation.adjustedSize ?? signal.suggestedSize,
+          config.maxTradeSize
+        );
+        const tradeCost = finalSize * signal.price;
+
+        if (tradeCost > cycleBalance) {
+          await ctx.runMutation(internal.trackedTraders.internalUpdateSignalStatus, {
+            signalId,
+            status: "skipped",
+          });
+          continue;
+        }
+
+        // Deduct from wallet
+        const deducted = await ctx.runMutation(internal.wallet.internalDeductForTrade, {
+          cost: tradeCost,
+        });
+
+        if (!deducted) {
+          await ctx.runMutation(internal.trackedTraders.internalUpdateSignalStatus, {
+            signalId,
+            status: "skipped",
+          });
+          continue;
+        }
+
+        cycleBalance -= tradeCost;
+
+        // Execute trade (or dry run)
+        if (!config.dryRun) {
+          try {
+            const { initClient } = await import("../src/tools/polymarket-client");
+            const { Side, OrderType } = await import("@polymarket/clob-client");
+            const polyClient = await initClient();
+            await polyClient.createAndPostOrder(
+              {
+                tokenID: signal.tokenId,
+                price: signal.price,
+                size: finalSize,
+                side: Side.BUY,
+              },
+              { tickSize: "0.01", negRisk: false },
+              OrderType.GTC
+            );
+          } catch (orderErr) {
+            await ctx.runMutation(internal.agentActions.internalLogAction, {
+              type: "error",
+              summary: `Copy-trade order failed: ${String(orderErr)}`,
+              details: { cycleId, conditionId: signal.conditionId },
+              timestamp: Date.now(),
+              cycleId,
+            });
+            continue;
+          }
+        }
+
+        // Record the trade
+        const status: "dry_run" | "pending" = config.dryRun ? "dry_run" : "pending";
+        await ctx.runMutation(internal.trades.internalRecordTrade, {
+          conditionId: signal.conditionId,
+          question: signal.question,
+          tokenId: signal.tokenId,
+          side: signal.side,
+          size: finalSize,
+          price: signal.price,
+          confidence: validation.confidence ?? 0.7,
+          reasoning: `[COPY TRADE] ${signal.reasoning} | LLM: ${validation.reasoning ?? "approved"}`,
+          status,
+          executedAt: Date.now(),
+        });
+
+        // Open position
+        const positionSide: "yes" | "no" = signal.side === "buy_yes" ? "yes" : "no";
+        await ctx.runMutation(internal.positions.internalOpenPosition, {
+          conditionId: signal.conditionId,
+          question: signal.question,
+          tokenId: signal.tokenId,
+          side: positionSide,
+          size: finalSize,
+          avgEntryPrice: signal.price,
+          currentPrice: signal.price,
+          unrealizedPnl: 0,
+          openedAt: Date.now(),
+        });
+
+        await ctx.runMutation(internal.trackedTraders.internalUpdateSignalStatus, {
+          signalId,
+          status: "executed",
+        });
+
+        executedCount++;
+      }
+
+      await ctx.runMutation(internal.agentActions.internalLogAction, {
+        type: "copy_trade_execute",
+        summary: `${config.dryRun ? "[DRY RUN] " : ""}Executed ${executedCount}/${signals.length} copy-trade signals`,
+        details: {
+          cycleId,
+          signalsGenerated: signals.length,
+          signalsExecuted: executedCount,
+          dryRun: config.dryRun,
+        },
+        timestamp: Date.now(),
+        cycleId,
+      });
+
+      // Reconcile wallet
+      const finalPositions = await ctx.runQuery(internal.positions.internalOpenPositions, {});
+      const totalInvested = finalPositions.reduce(
+        (sum: number, p: any) => sum + p.avgEntryPrice * p.size,
+        0
+      );
+      await ctx.runMutation(internal.wallet.internalReconcileWallet, {
+        openPositionsCost: totalInvested,
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      await ctx.runMutation(internal.agentActions.internalLogAction, {
+        type: "error",
+        summary: `Copy-trade cycle failed: ${message}`,
+        details: { cycleId, error: message },
+        timestamp: Date.now(),
+        cycleId,
+      });
+    }
+  },
+});
+
+// Refresh tracked traders from leaderboard (runs less frequently)
+export const refreshTrackedTraders = internalAction({
+  args: {},
+  handler: async (ctx) => {
+    try {
+      const { discoverTopTraders } = await import("../src/agent/copy-trader");
+      const topTraders = await discoverTopTraders(30);
+
+      for (const trader of topTraders) {
+        await ctx.runMutation(internal.trackedTraders.internalUpsertTrader, {
+          address: trader.address,
+          username: trader.username,
+          pnl: trader.pnl,
+          volume: trader.volume,
+          winRate: trader.winRate,
+          tradeCount: trader.tradeCount,
+          compositeScore: trader.compositeScore,
+          source: "leaderboard",
+          enabled: true,
+        });
+      }
+
+      await ctx.runMutation(internal.agentActions.internalLogAction, {
+        type: "copy_trade_scan",
+        summary: `Refreshed ${topTraders.length} tracked traders from leaderboard`,
+        details: {
+          count: topTraders.length,
+          top5: topTraders.slice(0, 5).map((t) => ({
+            username: t.username,
+            score: t.compositeScore,
+            pnl: t.pnl,
+          })),
+        },
+        timestamp: Date.now(),
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      await ctx.runMutation(internal.agentActions.internalLogAction, {
+        type: "error",
+        summary: `Trader refresh failed: ${message}`,
+        details: { error: message },
+        timestamp: Date.now(),
       });
     }
   },

@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "next lint",
     "derive-keys": "npx tsx scripts/derive-api-keys.ts",
-    "seed-config": "npx tsx scripts/seed-config.ts"
+    "seed-config": "npx tsx scripts/seed-config.ts",
+    "setup-wallet": "npx tsx scripts/setup-wallet.ts"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "^2.0.31",

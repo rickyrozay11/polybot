@@ -99,7 +99,47 @@ export type AgentActionType =
   | "research"
   | "trade"
   | "position_refresh"
+  | "copy_trade_scan"
+  | "copy_trade_execute"
   | "error";
+
+// --- Copy-Trading Types ---
+
+export interface TrackedTrader {
+  address: string;
+  username: string;
+  pnl: number;
+  volume: number;
+  winRate: number;
+  tradeCount: number;
+  compositeScore: number;
+  lastUpdated: number;
+}
+
+export interface TraderPosition {
+  conditionId: string;
+  question: string;
+  tokenId: string;
+  side: "yes" | "no";
+  size: number;
+  price: number;
+  timestamp: number;
+}
+
+export interface CopyTradeSignal {
+  traderAddress: string;
+  traderUsername: string;
+  traderScore: number;
+  conditionId: string;
+  question: string;
+  tokenId: string;
+  side: "buy_yes" | "buy_no";
+  traderSize: number;
+  suggestedSize: number;
+  price: number;
+  consensus: number; // 0-1 how many tracked traders agree
+  reasoning: string;
+}
 
 export interface AgentAction {
   type: AgentActionType;
@@ -190,7 +230,7 @@ export const DEFAULT_CONFIG: AgentConfig = {
   maxTradeSize: 25,
   maxTotalExposure: 500,
   minConfidence: 0.6,
-  modelId: "x-ai/grok-4.1-fast",
+  modelId: "x-ai/grok-4.20-multi-agent-beta",
   runIntervalMinutes: 15,
   enabled: true,
   dryRun: true,

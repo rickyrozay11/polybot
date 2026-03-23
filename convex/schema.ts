@@ -45,6 +45,58 @@ export default defineSchema({
     .index("by_status", ["status"])
     .index("by_conditionId", ["conditionId"]),
 
+  trackedTraders: defineTable({
+    address: v.string(),
+    username: v.string(),
+    pnl: v.float64(),
+    volume: v.float64(),
+    winRate: v.float64(),
+    tradeCount: v.float64(),
+    compositeScore: v.float64(),
+    lastUpdated: v.float64(),
+    source: v.union(v.literal("leaderboard"), v.literal("whale"), v.literal("manual")),
+    enabled: v.boolean(),
+  })
+    .index("by_address", ["address"])
+    .index("by_compositeScore", ["compositeScore"])
+    .index("by_enabled", ["enabled"]),
+
+  traderActivity: defineTable({
+    traderAddress: v.string(),
+    conditionId: v.string(),
+    question: v.string(),
+    tokenId: v.string(),
+    side: v.union(v.literal("buy_yes"), v.literal("buy_no")),
+    size: v.float64(),
+    price: v.float64(),
+    detectedAt: v.float64(),
+    copied: v.boolean(),
+    copyTradeId: v.optional(v.string()),
+  })
+    .index("by_traderAddress", ["traderAddress"])
+    .index("by_conditionId", ["conditionId"])
+    .index("by_detectedAt", ["detectedAt"])
+    .index("by_copied", ["copied"]),
+
+  copyTradeSignals: defineTable({
+    conditionId: v.string(),
+    question: v.string(),
+    tokenId: v.string(),
+    side: v.union(v.literal("buy_yes"), v.literal("buy_no")),
+    traderCount: v.float64(),
+    consensus: v.float64(),
+    avgTraderScore: v.float64(),
+    suggestedSize: v.float64(),
+    price: v.float64(),
+    status: v.union(v.literal("pending"), v.literal("executed"), v.literal("skipped"), v.literal("expired")),
+    reasoning: v.string(),
+    createdAt: v.float64(),
+    executedAt: v.optional(v.float64()),
+  })
+    .index("by_status", ["status"])
+    .index("by_conditionId", ["conditionId"])
+    .index("by_createdAt", ["createdAt"]),
+
   agentActions: defineTable({
     type: v.union(
       v.literal("scan"),
@@ -53,6 +105,8 @@ export default defineSchema({
       v.literal("research"),
       v.literal("trade"),
       v.literal("position_refresh"),
+      v.literal("copy_trade_scan"),
+      v.literal("copy_trade_execute"),
       v.literal("error")
     ),
     summary: v.string(),

@@ -15,6 +15,7 @@ import type * as config from "../config.js";
 import type * as crons from "../crons.js";
 import type * as markets from "../markets.js";
 import type * as positions from "../positions.js";
+import type * as trackedTraders from "../trackedTraders.js";
 import type * as trades from "../trades.js";
 import type * as wallet from "../wallet.js";
 
@@ -32,6 +33,7 @@ declare const fullApi: ApiFromModules<{
   crons: typeof crons;
   markets: typeof markets;
   positions: typeof positions;
+  trackedTraders: typeof trackedTraders;
   trades: typeof trades;
   wallet: typeof wallet;
 }>;

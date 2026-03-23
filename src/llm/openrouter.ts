@@ -6,7 +6,7 @@ export class OpenRouterProvider implements LLMProvider {
   private client: OpenAI;
   private modelId: string;
 
-  constructor({ apiKey, modelId = "x-ai/grok-4.1-fast" }: { apiKey: string; modelId?: string }) {
+  constructor({ apiKey, modelId = "x-ai/grok-4.20-multi-agent-beta" }: { apiKey: string; modelId?: string }) {
     this.modelId = modelId;
     this.client = new OpenAI({
       apiKey,

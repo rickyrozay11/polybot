@@ -5,7 +5,7 @@ const defaults: Record<string, string> = {
   maxTradeSize: "25",
   maxTotalExposure: "500",
   minConfidence: "0.6",
-  modelId: "x-ai/grok-4.1-fast",
+  modelId: "x-ai/grok-4.20-multi-agent-beta",
   runIntervalMinutes: "15",
   enabled: "true",
   dryRun: "true",

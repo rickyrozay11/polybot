@@ -13,6 +13,7 @@ import {
   X,
   MessageSquare,
   Activity,
+  Users,
 } from "lucide-react";
 import { cn } from "@/src/lib/utils";
 
@@ -20,6 +21,7 @@ const links = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
   { href: "/markets", label: "Markets", icon: TrendingUp },
   { href: "/positions", label: "Positions", icon: Wallet },
+  { href: "/copy-trade", label: "Copy Trade", icon: Users },
   { href: "/activity", label: "Activity", icon: Activity },
   { href: "/chat", label: "Chat", icon: MessageSquare },
   { href: "/settings", label: "Settings", icon: Settings },
