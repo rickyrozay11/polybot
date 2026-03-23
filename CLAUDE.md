@@ -12,10 +12,19 @@ Autonomous Polymarket trading bot with copy-trading intelligence, powered by Gro
 - **Data**: Polymarket Data API (leaderboard, trader activity, positions)
 - **Streaming**: AI SDK (`ai` + `@ai-sdk/react` + `@ai-sdk/openai-compatible`) with `streamText`, `smoothStream`, `useChat`
 
-## Important: Model Differences
+## Important: Model Architecture
 
-- **Chat route** (`app/api/chat/route.ts`) uses `x-ai/grok-4.20-beta` because it supports tool calling through OpenRouter. This powers the 5 live Polymarket tools.
-- **Backend agent pipelines** (`src/llm/openrouter.ts`) default to `x-ai/grok-4.20-multi-agent-beta` which does NOT support tool calling via OpenRouter. The agent pipeline uses its own tool registry (`src/tools/tool-registry.ts`) with manual tool execution loops instead.
+- **Chat route** (`app/api/chat/route.ts`) uses **multi-model routing**:
+  - Fast queries (price checks, listings) → `x-ai/grok-4.20-beta` (supports tool calling)
+  - Complex queries (analysis, strategy) → `anthropic/claude-opus-4-6` (supports tool calling)
+  - Routing is automatic via keyword-based complexity classification
+- **Backend agent pipelines** use **4-model ensemble voting** via OpenRouter:
+  - `x-ai/grok-4.20-multi-agent-beta` (does NOT support tool calling)
+  - `anthropic/claude-opus-4-6` (supports tool calling)
+  - `openai/gpt-5.4` (supports tool calling)
+  - `deepseek/deepseek-v3.2` (supports tool calling)
+  - Consensus: 3+ models must agree, or 2+ with avg confidence > 0.7
+- All models accessed through **single OpenRouter API key** for unified billing
 
 ## Project Structure
 
@@ -59,10 +68,13 @@ polybot/
 │   │   ├── copy-trader.ts  # Copy-trading engine (discovery, scoring, signals)
 │   │   ├── prompts.ts      # LLM system + task prompts (dual-mode)
 │   │   ├── market-scorer.ts # Market filtering + scoring
-│   │   └── risk-manager.ts # Risk checks (confidence, size, exposure)
+│   │   ├── risk-manager.ts # Risk checks (confidence, size, exposure)
+│   │   ├── convergence-trader.ts  # CEX price lag detection (Binance + Coinbase)
+│   │   └── whale-tracker.ts       # $10K+ trade monitoring, insider detection
 │   ├── llm/
 │   │   ├── openrouter.ts   # OpenRouter provider (Grok 4.20 Multi-Agent default)
 │   │   ├── provider.ts     # Provider factory
+│   │   ├── multi-model-provider.ts # MultiModel, Ensemble, and ChatRouter providers
 │   │   └── types.ts        # LLM interface types
 │   ├── tools/
 │   │   ├── polymarket-client.ts    # CLOB client (orders, orderbook)
@@ -71,7 +83,8 @@ polybot/
 │   │   ├── tool-registry.ts        # LLM tool definitions + executor
 │   │   ├── firecrawl-search.ts     # Web search
 │   │   ├── perplexity-search.ts    # Real-time Q&A
-│   │   └── apify-scraper.ts        # Social sentiment
+│   │   ├── apify-scraper.ts        # Social sentiment
+│   │   └── polymarket-ws.ts        # WebSocket client (real-time prices, whale alerts)
 │   ├── lib/
 │   │   ├── retry.ts        # Exponential backoff retry utility
 │   │   ├── env.ts          # Environment variable helpers
@@ -123,9 +136,26 @@ Pipeline: Discover Top Traders → Scan Activity → Generate Consensus Signals 
 
 Copy-trading scores traders using a composite of PnL (35%), win rate (25%), volume (20%), and recency (20%). Only copies trades where multiple top traders agree (consensus-based).
 
+### 3. CEX Convergence Trading
+Detects price lag between Binance/Coinbase crypto prices and corresponding Polymarket prediction markets. When BTC moves on CEXs before Polymarket odds adjust, generates convergence signals with confidence proportional to the lag size.
+
+### 4. Whale Tracking ($10K+ Trades)
+Monitors Polymarket for trades ≥ $10,000. Detects volume spikes (3x normal), flags potential insider activity, and generates whale consensus signals when multiple large traders agree on the same market side.
+
+## Ensemble Voting System
+
+Trade decisions are validated through a 4-model ensemble:
+1. All 4 models receive the same signal/prompt in parallel
+2. Each model votes: buy_yes, buy_no, or skip (with confidence 0-1)
+3. Consensus rules:
+   - **Full** (3+ agree): Execute with averaged confidence
+   - **Majority** (2 agree + avg confidence > 0.7): Execute cautiously
+   - **Weak/None**: Skip the trade
+4. Model weights start equal (1.0) and can be adjusted based on historical accuracy
+
 ## Database Tables (Convex)
 
-`trades`, `positions`, `trackedTraders`, `traderActivity`, `copyTradeSignals`, `agentActions`, `markets`, `analytics`, `config`, `wallet`
+`trades`, `positions`, `trackedTraders`, `traderActivity`, `copyTradeSignals`, `agentActions`, `markets`, `analytics`, `config`, `wallet`, `ensembleVotes`, `whaleAlerts`, `convergenceSignals`
 
 ## Cron Jobs
 
@@ -161,6 +191,8 @@ FIRECRAWL_API_KEY=            # Web search
 PERPLEXITY_API_KEY=           # Real-time Q&A
 APIFY_API_TOKEN=              # Social sentiment
 ```
+
+All LLM models (Grok, Claude, GPT, DeepSeek) are accessed via OpenRouter using the single `OPENROUTER_API_KEY`. No separate API keys needed.
 
 ## Commands
 
@@ -198,3 +230,5 @@ Both `npm run dev` and `npx convex dev` must be running simultaneously for the a
 
 - Grok 4.20 Multi-Agent Beta does NOT support tool calling through OpenRouter — use Grok 4.20 Beta for any tool-calling features
 - Polymarket Data API leaderboard endpoint requires `/v1/` prefix and specific param names (`timePeriod`, `orderBy`, `category`)
+- GPT-5.4 and DeepSeek V3.2 model availability depends on OpenRouter — check their status page if ensemble votes fail
+- WebSocket connections require the `ws` npm package for Node.js server-side usage

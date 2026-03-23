@@ -63,6 +63,8 @@ export const runAgentCycle = internalAction({
     try {
       const { runPipeline } = await import("../src/agent/pipeline");
       const { OpenRouterProvider } = await import("../src/llm/openrouter");
+      const { EnsembleProvider } = await import("../src/llm/multi-model-provider");
+      const { SYSTEM_PROMPT } = await import("../src/agent/prompts");
       const { fetchTrendingMarkets } = await import(
         "../src/tools/polymarket-scanner"
       );
@@ -112,6 +114,18 @@ export const runAgentCycle = internalAction({
         modelId: config.modelId,
       });
 
+      // Set up ensemble provider for trade decision validation
+      const ensembleModelIds = [
+        "x-ai/grok-4.20-multi-agent-beta",
+        "anthropic/claude-opus-4-6",
+        "openai/gpt-5.4",
+        "deepseek/deepseek-v3.2",
+      ];
+      const ensemble = new EnsembleProvider({
+        apiKey: process.env.OPENROUTER_API_KEY!,
+        modelIds: ensembleModelIds,
+      });
+
       let polyClient: any = null;
       if (!config.dryRun) {
         polyClient = initClient();
@@ -152,6 +166,135 @@ export const runAgentCycle = internalAction({
             trade.action === "buy_yes" || trade.side === "buy_yes"
               ? "buy_yes"
               : "buy_no";
+
+          // --- Ensemble validation before recording trade ---
+          const ensembleValidationPrompt = `You are a prediction market trading validator. A single-model pipeline has proposed the following trade:
+
+Market: "${trade.question}"
+Action: ${trade.action}
+Token ID: ${trade.tokenId}
+Size: $${trade.size}
+Price: $${trade.price}
+Confidence: ${trade.confidence}
+Reasoning: ${trade.reasoning}
+
+Do you agree with this trade? Respond with JSON only:
+{
+  "action": "buy_yes" | "buy_no" | "skip",
+  "confidence": <0.0-1.0>,
+  "reasoning": "<brief explanation>"
+}`;
+
+          try {
+            const ensembleResult = await ensemble.chatEnsemble({
+              messages: [
+                { role: "system", content: SYSTEM_PROMPT },
+                { role: "user", content: ensembleValidationPrompt },
+              ],
+              temperature: 0.2,
+              response_format: { type: "json_object" },
+            });
+
+            // Record ensemble vote to the ensembleVotes table
+            const parsedVotes = ensembleResult.votes.map((v) => {
+              try {
+                const parsed = JSON.parse(v.response.content ?? "{}");
+                return {
+                  modelId: v.modelId,
+                  action: (parsed.action ?? "skip") as "buy_yes" | "buy_no" | "skip",
+                  confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0.5,
+                  reasoning: parsed.reasoning ?? "",
+                  latencyMs: v.latencyMs,
+                };
+              } catch {
+                return {
+                  modelId: v.modelId,
+                  action: "skip" as const,
+                  confidence: 0,
+                  reasoning: "Failed to parse response",
+                  latencyMs: v.latencyMs,
+                };
+              }
+            });
+
+            await ctx.runMutation(internal.agentActions.internalRecordEnsembleVote, {
+              cycleId,
+              conditionId: trade.conditionId,
+              question: trade.question,
+              votes: parsedVotes,
+              consensusAction: ensembleResult.consensus.action,
+              consensusConfidence: ensembleResult.consensus.confidence,
+              agreementLevel: ensembleResult.consensus.agreementLevel,
+              createdAt: Date.now(),
+            });
+
+            // Log ensemble vote as an agent action too
+            await ctx.runMutation(internal.agentActions.internalLogAction, {
+              type: "ensemble_vote",
+              summary: `Ensemble ${ensembleResult.consensus.agreementLevel} on "${trade.question}": ${ensembleResult.consensus.action} (${(ensembleResult.consensus.confidence * 100).toFixed(0)}%)`,
+              details: {
+                cycleId,
+                conditionId: trade.conditionId,
+                consensusAction: ensembleResult.consensus.action,
+                consensusConfidence: ensembleResult.consensus.confidence,
+                agreementLevel: ensembleResult.consensus.agreementLevel,
+                voteCounts: ensembleResult.consensus.voteCounts,
+              },
+              timestamp: Date.now(),
+              cycleId,
+            });
+
+            // Reject trade if ensemble disagrees
+            if (
+              ensembleResult.consensus.agreementLevel === "none" ||
+              ensembleResult.consensus.agreementLevel === "weak"
+            ) {
+              await ctx.runMutation(internal.agentActions.internalLogAction, {
+                type: "trade",
+                summary: `Trade rejected by ensemble (${ensembleResult.consensus.agreementLevel} agreement): "${trade.question}"`,
+                details: {
+                  conditionId: trade.conditionId,
+                  originalAction: trade.action,
+                  ensembleAction: ensembleResult.consensus.action,
+                  agreementLevel: ensembleResult.consensus.agreementLevel,
+                },
+                timestamp: Date.now(),
+                cycleId,
+              });
+              return; // Skip this trade
+            }
+
+            // If ensemble agrees but suggests different action, use ensemble's action
+            if (ensembleResult.consensus.action === "skip") {
+              await ctx.runMutation(internal.agentActions.internalLogAction, {
+                type: "trade",
+                summary: `Trade vetoed by ensemble consensus (skip): "${trade.question}"`,
+                details: {
+                  conditionId: trade.conditionId,
+                  originalAction: trade.action,
+                  ensembleAction: "skip",
+                },
+                timestamp: Date.now(),
+                cycleId,
+              });
+              return; // Skip this trade
+            }
+
+            // Use ensemble confidence as a cap on the trade confidence
+            trade.confidence = Math.min(trade.confidence, ensembleResult.consensus.confidence);
+            trade.reasoning = `[Ensemble: ${ensembleResult.consensus.agreementLevel}] ${trade.reasoning}`;
+          } catch (ensembleErr) {
+            // If ensemble fails, log but still allow the trade (graceful degradation)
+            await ctx.runMutation(internal.agentActions.internalLogAction, {
+              type: "error",
+              summary: `Ensemble validation failed, proceeding with single-model decision: ${String(ensembleErr)}`,
+              details: { cycleId, conditionId: trade.conditionId, error: String(ensembleErr) },
+              timestamp: Date.now(),
+              cycleId,
+            });
+          }
+          // --- End ensemble validation ---
+
           const status: "dry_run" | "pending" = trade.dryRun
             ? "dry_run"
             : "pending";
@@ -459,9 +602,23 @@ export const runCopyTradeCycle = internalAction({
         return;
       }
 
-      // Step 4: LLM validation with Grok 4.20
+      // Step 4: Ensemble LLM validation (multi-model consensus)
+      const { EnsembleProvider: EP } = await import("../src/llm/multi-model-provider");
+      const ensembleModelIds = [
+        "x-ai/grok-4.20-multi-agent-beta",
+        "anthropic/claude-opus-4-6",
+        "openai/gpt-5.4",
+        "deepseek/deepseek-v3.2",
+      ];
+      const ensemble = new EP({
+        apiKey: process.env.OPENROUTER_API_KEY!,
+        modelIds: ensembleModelIds,
+      });
+
       const validationPrompt = buildCopyTradeValidationPrompt(signals);
-      const validationResponse = await llm.chat({
+
+      // Run ensemble validation - all 4 models vote on the signals
+      const ensembleResult = await ensemble.chatEnsemble({
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: validationPrompt },
@@ -470,6 +627,63 @@ export const runCopyTradeCycle = internalAction({
         response_format: { type: "json_object" },
       });
 
+      await ctx.runMutation(internal.agentActions.internalLogAction, {
+        type: "ensemble_vote",
+        summary: `Ensemble validation: ${ensembleResult.consensus.agreementLevel} agreement on ${signals.length} signals (${ensembleResult.votes.length} models voted)`,
+        details: {
+          cycleId,
+          agreementLevel: ensembleResult.consensus.agreementLevel,
+          consensusAction: ensembleResult.consensus.action,
+          consensusConfidence: ensembleResult.consensus.confidence,
+          voteCounts: ensembleResult.consensus.voteCounts,
+          modelResults: ensembleResult.votes.map(v => ({
+            modelId: v.modelId,
+            latencyMs: v.latencyMs,
+            hasContent: !!v.response.content,
+          })),
+        },
+        timestamp: Date.now(),
+        cycleId,
+      });
+
+      // Record ensemble vote to the dedicated ensembleVotes table
+      const copyTradeParsedVotes = ensembleResult.votes.map((v) => {
+        try {
+          const parsed = JSON.parse(v.response.content ?? "{}");
+          return {
+            modelId: v.modelId,
+            action: (parsed.action ?? "skip") as "buy_yes" | "buy_no" | "skip",
+            confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0.5,
+            reasoning: parsed.reasoning ?? "",
+            latencyMs: v.latencyMs,
+          };
+        } catch {
+          return {
+            modelId: v.modelId,
+            action: "skip" as const,
+            confidence: 0,
+            reasoning: "Failed to parse response",
+            latencyMs: v.latencyMs,
+          };
+        }
+      });
+
+      // Write one ensembleVotes record per signal (or one aggregate if signals share a market)
+      const firstSignal = signals[0];
+      if (firstSignal) {
+        await ctx.runMutation(internal.agentActions.internalRecordEnsembleVote, {
+          cycleId,
+          conditionId: firstSignal.conditionId,
+          question: firstSignal.question,
+          votes: copyTradeParsedVotes,
+          consensusAction: ensembleResult.consensus.action,
+          consensusConfidence: ensembleResult.consensus.confidence,
+          agreementLevel: ensembleResult.consensus.agreementLevel,
+          createdAt: Date.now(),
+        });
+      }
+
+      // Parse individual model validations and merge into consensus
       let validations: Array<{
         index: number;
         approved: boolean;
@@ -478,16 +692,35 @@ export const runCopyTradeCycle = internalAction({
         reasoning?: string;
       }> = [];
 
-      try {
-        const parsed = JSON.parse(validationResponse.content ?? "{}");
-        validations = parsed.validations ?? parsed.data ?? parsed.results ?? [];
-      } catch {
-        // If parsing fails, skip validation and approve all with default confidence
+      // Use the first successful model's structured response for per-signal validations
+      for (const vote of ensembleResult.votes) {
+        try {
+          const parsed = JSON.parse(vote.response.content ?? "{}");
+          const vList = parsed.validations ?? parsed.data ?? parsed.results ?? [];
+          if (vList.length > 0) {
+            // Apply ensemble consensus confidence as a multiplier
+            validations = vList.map((v: any) => ({
+              ...v,
+              approved: v.approved && ensembleResult.consensus.agreementLevel !== "none",
+              confidence: Math.min(v.confidence ?? 0.7, ensembleResult.consensus.confidence ?? 0.5),
+              reasoning: `[Ensemble: ${ensembleResult.consensus.agreementLevel}] ${v.reasoning ?? ""}`,
+            }));
+            break;
+          }
+        } catch {
+          continue;
+        }
+      }
+
+      // Fallback if no model produced parseable validations
+      if (validations.length === 0) {
+        const ensembleApproved = ensembleResult.consensus.agreementLevel !== "none" &&
+                                  ensembleResult.consensus.agreementLevel !== "weak";
         validations = signals.map((_, i) => ({
           index: i + 1,
-          approved: true,
-          confidence: 0.6,
-          reasoning: "LLM validation parse failed, using default approval",
+          approved: ensembleApproved,
+          confidence: ensembleResult.consensus.confidence,
+          reasoning: `Ensemble ${ensembleResult.consensus.agreementLevel} consensus (no structured per-signal validation available)`,
         }));
       }
 

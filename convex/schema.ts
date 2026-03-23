@@ -107,6 +107,9 @@ export default defineSchema({
       v.literal("position_refresh"),
       v.literal("copy_trade_scan"),
       v.literal("copy_trade_execute"),
+      v.literal("whale_alert"),
+      v.literal("convergence_signal"),
+      v.literal("ensemble_vote"),
       v.literal("error")
     ),
     summary: v.string(),
@@ -166,4 +169,68 @@ export default defineSchema({
     tradeCount: v.float64(),
     updatedAt: v.float64(),
   }),
+
+  ensembleVotes: defineTable({
+    cycleId: v.string(),
+    conditionId: v.string(),
+    question: v.string(),
+    votes: v.array(v.object({
+      modelId: v.string(),
+      action: v.union(v.literal("buy_yes"), v.literal("buy_no"), v.literal("skip")),
+      confidence: v.float64(),
+      reasoning: v.string(),
+      latencyMs: v.float64(),
+    })),
+    consensusAction: v.union(v.literal("buy_yes"), v.literal("buy_no"), v.literal("skip")),
+    consensusConfidence: v.float64(),
+    agreementLevel: v.union(v.literal("full"), v.literal("majority"), v.literal("weak"), v.literal("none")),
+    modelWeights: v.optional(v.any()),
+    createdAt: v.float64(),
+  })
+    .index("by_cycleId", ["cycleId"])
+    .index("by_conditionId", ["conditionId"])
+    .index("by_createdAt", ["createdAt"]),
+
+  whaleAlerts: defineTable({
+    traderAddress: v.string(),
+    conditionId: v.string(),
+    question: v.string(),
+    tokenId: v.string(),
+    side: v.union(v.literal("buy_yes"), v.literal("buy_no")),
+    size: v.float64(),
+    price: v.float64(),
+    totalValue: v.float64(),
+    isInsider: v.boolean(),
+    marketSlug: v.optional(v.string()),
+    detectedAt: v.float64(),
+    actedOn: v.boolean(),
+    actionTaken: v.optional(v.string()),
+  })
+    .index("by_detectedAt", ["detectedAt"])
+    .index("by_conditionId", ["conditionId"])
+    .index("by_traderAddress", ["traderAddress"])
+    .index("by_totalValue", ["totalValue"]),
+
+  convergenceSignals: defineTable({
+    conditionId: v.string(),
+    question: v.string(),
+    tokenId: v.string(),
+    side: v.union(v.literal("buy_yes"), v.literal("buy_no")),
+    exchange: v.string(),
+    symbol: v.string(),
+    cexPrice: v.float64(),
+    polymarketPrice: v.float64(),
+    expectedPolyPrice: v.float64(),
+    priceLagPercent: v.float64(),
+    confidence: v.float64(),
+    suggestedSize: v.float64(),
+    reasoning: v.string(),
+    status: v.union(v.literal("pending"), v.literal("executed"), v.literal("expired"), v.literal("skipped")),
+    detectedAt: v.float64(),
+    executedAt: v.optional(v.float64()),
+  })
+    .index("by_status", ["status"])
+    .index("by_conditionId", ["conditionId"])
+    .index("by_detectedAt", ["detectedAt"])
+    .index("by_exchange", ["exchange"]),
 });

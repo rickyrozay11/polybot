@@ -11,6 +11,7 @@
 import type * as agentActions from "../agentActions.js";
 import type * as agentRun from "../agentRun.js";
 import type * as analytics from "../analytics.js";
+import type * as botSimulator from "../botSimulator.js";
 import type * as config from "../config.js";
 import type * as crons from "../crons.js";
 import type * as markets from "../markets.js";
@@ -29,6 +30,7 @@ declare const fullApi: ApiFromModules<{
   agentActions: typeof agentActions;
   agentRun: typeof agentRun;
   analytics: typeof analytics;
+  botSimulator: typeof botSimulator;
   config: typeof config;
   crons: typeof crons;
   markets: typeof markets;
