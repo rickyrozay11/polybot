@@ -3,6 +3,11 @@
 import { internalAction } from "./_generated/server";
 import { internal } from "./_generated/api";
 
+/** Strip markdown code fences from LLM responses before JSON.parse */
+function stripCodeFences(text: string): string {
+  return text.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim();
+}
+
 export const runAgentCycle = internalAction({
   args: {},
   handler: async (ctx) => {
@@ -114,12 +119,18 @@ export const runAgentCycle = internalAction({
         modelId: config.modelId,
       });
 
+      // Tool-capable LLM for research stage (grok multi-agent doesn't support tool calling)
+      const toolLlm = new OpenRouterProvider({
+        apiKey: process.env.OPENROUTER_API_KEY!,
+        modelId: "deepseek/deepseek-v3.2",
+      });
+
       // Set up ensemble provider for trade decision validation
       const ensembleModelIds = [
-        "x-ai/grok-4.20-multi-agent-beta",
-        "anthropic/claude-opus-4-6",
-        "openai/gpt-5.4",
         "deepseek/deepseek-v3.2",
+        "google/gemini-3-flash-preview",
+        "openai/gpt-5.4",
+        "anthropic/claude-sonnet-4-6",
       ];
       const ensemble = new EnsembleProvider({
         apiKey: process.env.OPENROUTER_API_KEY!,
@@ -148,6 +159,7 @@ export const runAgentCycle = internalAction({
 
       await runPipeline({
         llm,
+        toolLlm,
         scanner: { fetchTrendingMarkets },
         polyClient,
         toolDeps: {},
@@ -198,7 +210,7 @@ Do you agree with this trade? Respond with JSON only:
             // Record ensemble vote to the ensembleVotes table
             const parsedVotes = ensembleResult.votes.map((v) => {
               try {
-                const parsed = JSON.parse(v.response.content ?? "{}");
+                const parsed = JSON.parse(stripCodeFences(v.response.content ?? "{}"));
                 return {
                   modelId: v.modelId,
                   action: (parsed.action ?? "skip") as "buy_yes" | "buy_no" | "skip",
@@ -443,7 +455,7 @@ export const runCopyTradeCycle = internalAction({
     });
 
     try {
-      const { discoverTopTraders, scanTraderActivity, generateCopySignals, buildCopyTradeValidationPrompt } =
+      const { discoverTopTraders, scanTraderActivity, generateCopySignals, buildCopyTradeValidationPrompt, shouldDisableTrader, detectCopyExits } =
         await import("../src/agent/copy-trader");
       const { OpenRouterProvider } = await import("../src/llm/openrouter");
       const { SYSTEM_PROMPT } = await import("../src/agent/prompts");
@@ -489,17 +501,25 @@ export const runCopyTradeCycle = internalAction({
             compositeScore: trader.compositeScore,
             source: "leaderboard",
             enabled: true,
+            roi: trader.roi,
+            realWinRate: trader.realWinRate,
+            consistency: trader.consistency,
+            decayedScore: trader.decayedScore,
+            lastTradeAt: trader.lastTradeAt,
           });
         }
 
         await ctx.runMutation(internal.agentActions.internalLogAction, {
           type: "copy_trade_scan",
-          summary: `Discovered ${topTraders.length} top traders from leaderboard`,
+          summary: `Discovered ${topTraders.length} top traders (ROI-scored)`,
           details: {
             cycleId,
             traders: topTraders.slice(0, 5).map((t) => ({
               username: t.username,
               score: t.compositeScore,
+              decayed: t.decayedScore,
+              roi: t.roi,
+              realWinRate: t.realWinRate,
               pnl: t.pnl,
             })),
           },
@@ -585,9 +605,58 @@ export const runCopyTradeCycle = internalAction({
         }
       }
 
-      // Step 3: Generate consensus signals
+      // Step 2.5: Detect trader exits — if top traders are selling positions we hold, exit too
       const openPositions = await ctx.runQuery(internal.positions.internalOpenPositions, {});
       const existingPositionIds = openPositions.map((p: any) => p.conditionId);
+
+      const copyExits = detectCopyExits(detections, existingPositionIds);
+      for (const exit of copyExits) {
+        const position = openPositions.find((p: any) => p.conditionId === exit.conditionId);
+        if (!position) continue;
+
+        // Fetch current price for the exit
+        try {
+          const res = await fetch(`https://clob.polymarket.com/midpoint?token_id=${position.tokenId}`);
+          if (!res.ok) continue;
+          const data = (await res.json()) as { mid: string };
+          const currentPrice = parseFloat(data.mid);
+          if (isNaN(currentPrice)) continue;
+
+          const unrealizedPnl = (currentPrice - position.avgEntryPrice) * position.size *
+            (position.side === "yes" ? 1 : -1);
+
+          await ctx.runMutation(internal.positions.internalClosePosition, {
+            positionId: position._id,
+            status: "closed",
+            currentPrice,
+            unrealizedPnl,
+            closedAt: Date.now(),
+            exitReason: `copy_exit:${exit.traderUsername}`,
+          });
+
+          // Credit wallet
+          const exitValue = currentPrice * position.size;
+          await ctx.runMutation(internal.wallet.internalCreditFromExit, { amount: exitValue });
+
+          // Close copy performance record
+          await ctx.runMutation(internal.trackedTraders.internalCloseCopyResult, {
+            conditionId: exit.conditionId,
+            exitPrice: currentPrice,
+          });
+
+          await ctx.runMutation(internal.agentActions.internalLogAction, {
+            type: "copy_exit",
+            summary: `Copy-exit: ${exit.reason} — PnL: $${unrealizedPnl.toFixed(2)}`,
+            details: { cycleId, ...exit, pnl: unrealizedPnl, exitPrice: currentPrice },
+            timestamp: Date.now(),
+            cycleId,
+          });
+        } catch {
+          // Non-critical, skip this exit
+        }
+      }
+
+      // Step 3: Generate consensus signals
 
       const signals = await generateCopySignals(detections, config, existingPositionIds);
 
@@ -605,10 +674,10 @@ export const runCopyTradeCycle = internalAction({
       // Step 4: Ensemble LLM validation (multi-model consensus)
       const { EnsembleProvider: EP } = await import("../src/llm/multi-model-provider");
       const ensembleModelIds = [
-        "x-ai/grok-4.20-multi-agent-beta",
-        "anthropic/claude-opus-4-6",
-        "openai/gpt-5.4",
         "deepseek/deepseek-v3.2",
+        "google/gemini-3-flash-preview",
+        "openai/gpt-5.4",
+        "anthropic/claude-sonnet-4-6",
       ];
       const ensemble = new EP({
         apiKey: process.env.OPENROUTER_API_KEY!,
@@ -649,7 +718,7 @@ export const runCopyTradeCycle = internalAction({
       // Record ensemble vote to the dedicated ensembleVotes table
       const copyTradeParsedVotes = ensembleResult.votes.map((v) => {
         try {
-          const parsed = JSON.parse(v.response.content ?? "{}");
+          const parsed = JSON.parse(stripCodeFences(v.response.content ?? "{}"));
           return {
             modelId: v.modelId,
             action: (parsed.action ?? "skip") as "buy_yes" | "buy_no" | "skip",
@@ -695,7 +764,7 @@ export const runCopyTradeCycle = internalAction({
       // Use the first successful model's structured response for per-signal validations
       for (const vote of ensembleResult.votes) {
         try {
-          const parsed = JSON.parse(vote.response.content ?? "{}");
+          const parsed = JSON.parse(stripCodeFences(vote.response.content ?? "{}"));
           const vList = parsed.validations ?? parsed.data ?? parsed.results ?? [];
           if (vList.length > 0) {
             // Apply ensemble consensus confidence as a multiplier
@@ -829,6 +898,16 @@ export const runCopyTradeCycle = internalAction({
 
         // Open position
         const positionSide: "yes" | "no" = signal.side === "buy_yes" ? "yes" : "no";
+        // Calculate TP/SL prices (default: 12% take profit, 10% stop loss)
+        const tpPct = 0.12;
+        const slPct = 0.10;
+        const takeProfitPrice = positionSide === "yes"
+          ? signal.price * (1 + tpPct)
+          : signal.price * (1 - tpPct);
+        const stopLossPrice = positionSide === "yes"
+          ? signal.price * (1 - slPct)
+          : signal.price * (1 + slPct);
+
         await ctx.runMutation(internal.positions.internalOpenPosition, {
           conditionId: signal.conditionId,
           question: signal.question,
@@ -839,11 +918,27 @@ export const runCopyTradeCycle = internalAction({
           currentPrice: signal.price,
           unrealizedPnl: 0,
           openedAt: Date.now(),
+          takeProfitPrice: Math.round(takeProfitPrice * 1000) / 1000,
+          stopLossPrice: Math.round(stopLossPrice * 1000) / 1000,
+          copiedFrom: signal.traderAddress,
         });
 
         await ctx.runMutation(internal.trackedTraders.internalUpdateSignalStatus, {
           signalId,
           status: "executed",
+        });
+
+        // --- Per-trader P&L attribution ---
+        await ctx.runMutation(internal.trackedTraders.internalRecordCopyResult, {
+          traderAddress: signal.traderAddress,
+          conditionId: signal.conditionId,
+          question: signal.question,
+          side: signal.side,
+          copySize: finalSize,
+          copyPrice: signal.price,
+        });
+        await ctx.runMutation(internal.trackedTraders.internalIncrementCopyCount, {
+          address: signal.traderAddress,
         });
 
         executedCount++;
@@ -861,6 +956,29 @@ export const runCopyTradeCycle = internalAction({
         timestamp: Date.now(),
         cycleId,
       });
+
+      // --- Auto-disable underperforming traders ---
+      const allTracked = await ctx.runQuery(internal.trackedTraders.internalEnabledTraders, {});
+      let disabledCount = 0;
+      for (const trader of allTracked) {
+        const reason = shouldDisableTrader(trader as any);
+        if (reason) {
+          await ctx.runMutation(internal.trackedTraders.internalAutoDisableTrader, {
+            address: trader.address,
+            reason,
+          });
+          disabledCount++;
+        }
+      }
+      if (disabledCount > 0) {
+        await ctx.runMutation(internal.agentActions.internalLogAction, {
+          type: "copy_trade_scan",
+          summary: `Auto-disabled ${disabledCount} underperforming trader(s)`,
+          details: { cycleId, disabledCount },
+          timestamp: Date.now(),
+          cycleId,
+        });
+      }
 
       // Reconcile wallet
       const finalPositions = await ctx.runQuery(internal.positions.internalOpenPositions, {});
@@ -903,17 +1021,25 @@ export const refreshTrackedTraders = internalAction({
           compositeScore: trader.compositeScore,
           source: "leaderboard",
           enabled: true,
+          roi: trader.roi,
+          realWinRate: trader.realWinRate,
+          consistency: trader.consistency,
+          decayedScore: trader.decayedScore,
+          lastTradeAt: trader.lastTradeAt,
         });
       }
 
       await ctx.runMutation(internal.agentActions.internalLogAction, {
         type: "copy_trade_scan",
-        summary: `Refreshed ${topTraders.length} tracked traders from leaderboard`,
+        summary: `Refreshed ${topTraders.length} tracked traders (ROI-scored)`,
         details: {
           count: topTraders.length,
           top5: topTraders.slice(0, 5).map((t) => ({
             username: t.username,
             score: t.compositeScore,
+            decayed: t.decayedScore,
+            roi: t.roi,
+            realWinRate: t.realWinRate,
             pnl: t.pnl,
           })),
         },
@@ -939,6 +1065,8 @@ export const refreshPositions = internalAction({
       {}
     );
 
+    let exitCount = 0;
+
     for (const position of openPositions) {
       try {
         // Fetch current price from Polymarket API
@@ -956,6 +1084,80 @@ export const refreshPositions = internalAction({
           position.size *
           (position.side === "yes" ? 1 : -1);
 
+        // --- Auto-exit: take profit / stop loss ---
+        const pos = position as any;
+        const takeProfitPrice = pos.takeProfitPrice as number | undefined;
+        const stopLossPrice = pos.stopLossPrice as number | undefined;
+        let exitReason: string | null = null;
+
+        if (takeProfitPrice && position.side === "yes" && currentPrice >= takeProfitPrice) {
+          exitReason = `take_profit_hit_${(currentPrice * 100).toFixed(1)}pct`;
+        } else if (takeProfitPrice && position.side === "no" && currentPrice <= takeProfitPrice) {
+          exitReason = `take_profit_hit_${(currentPrice * 100).toFixed(1)}pct`;
+        } else if (stopLossPrice && position.side === "yes" && currentPrice <= stopLossPrice) {
+          exitReason = `stop_loss_hit_${(currentPrice * 100).toFixed(1)}pct`;
+        } else if (stopLossPrice && position.side === "no" && currentPrice >= stopLossPrice) {
+          exitReason = `stop_loss_hit_${(currentPrice * 100).toFixed(1)}pct`;
+        }
+
+        // Also exit if position has been open > 3 days (time stop)
+        const holdTimeMs = Date.now() - position.openedAt;
+        const maxHoldMs = 3 * 24 * 60 * 60 * 1000;
+        if (!exitReason && holdTimeMs > maxHoldMs) {
+          exitReason = `time_stop_${(holdTimeMs / (60 * 60 * 1000)).toFixed(0)}hrs`;
+        }
+
+        if (exitReason) {
+          // Close the position
+          await ctx.runMutation(internal.positions.internalClosePosition, {
+            positionId: position._id,
+            status: "closed",
+            currentPrice,
+            unrealizedPnl,
+            closedAt: Date.now(),
+            exitReason,
+          });
+
+          // Credit wallet back (entry cost + P&L)
+          const exitValue = currentPrice * position.size;
+          await ctx.runMutation(internal.wallet.internalCreditFromExit, {
+            amount: exitValue,
+          });
+
+          // Close copy-trade performance record if applicable
+          if (pos.copiedFrom) {
+            try {
+              const { internalCloseCopyResult } = await import("./trackedTraders");
+              // This is handled via the existing internalCloseCopyResult mutation
+              await ctx.runMutation(internal.trackedTraders.internalCloseCopyResult, {
+                conditionId: position.conditionId,
+                exitPrice: currentPrice,
+              });
+            } catch {
+              // Non-critical
+            }
+          }
+
+          await ctx.runMutation(internal.agentActions.internalLogAction, {
+            type: "auto_exit",
+            summary: `Auto-exit: ${exitReason} on "${position.question}" — PnL: $${unrealizedPnl.toFixed(2)}`,
+            details: {
+              conditionId: position.conditionId,
+              side: position.side,
+              entryPrice: position.avgEntryPrice,
+              exitPrice: currentPrice,
+              pnl: unrealizedPnl,
+              exitReason,
+              holdTimeHours: Math.round(holdTimeMs / (60 * 60 * 1000)),
+            },
+            timestamp: Date.now(),
+          });
+
+          exitCount++;
+          continue;
+        }
+
+        // Just update price if no exit triggered
         await ctx.runMutation(
           internal.positions.internalUpdatePositionPrice,
           {
@@ -969,10 +1171,14 @@ export const refreshPositions = internalAction({
       }
     }
 
+    const summary = exitCount > 0
+      ? `Refreshed ${openPositions.length} positions, auto-exited ${exitCount}`
+      : `Refreshed ${openPositions.length} open positions`;
+
     await ctx.runMutation(internal.agentActions.internalLogAction, {
       type: "position_refresh",
-      summary: `Refreshed ${openPositions.length} open positions`,
-      details: { count: openPositions.length },
+      summary,
+      details: { count: openPositions.length, exitCount },
       timestamp: Date.now(),
     });
 

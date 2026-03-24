@@ -101,6 +101,8 @@ export type AgentActionType =
   | "position_refresh"
   | "copy_trade_scan"
   | "copy_trade_execute"
+  | "copy_exit"
+  | "auto_exit"
   | "whale_alert"
   | "convergence_signal"
   | "ensemble_vote"
@@ -117,6 +119,31 @@ export interface TrackedTrader {
   tradeCount: number;
   compositeScore: number;
   lastUpdated: number;
+  // Enhanced scoring
+  roi?: number;
+  realWinRate?: number;
+  consistency?: number;
+  copyPnl?: number;
+  copyTradeCount?: number;
+  copyWinCount?: number;
+  decayedScore?: number;
+  avgHoldTime?: number;
+  lastTradeAt?: number;
+  disabledReason?: string;
+}
+
+export interface TraderPerformance {
+  traderAddress: string;
+  conditionId: string;
+  question: string;
+  side: "buy_yes" | "buy_no";
+  copySize: number;
+  copyPrice: number;
+  exitPrice?: number;
+  pnl?: number;
+  status: "open" | "closed" | "resolved";
+  openedAt: number;
+  closedAt?: number;
 }
 
 export interface TraderPosition {
@@ -142,6 +169,15 @@ export interface CopyTradeSignal {
   price: number;
   consensus: number; // 0-1 how many tracked traders agree
   reasoning: string;
+}
+
+export interface CopyExitSignal {
+  conditionId: string;
+  question: string;
+  traderAddress: string;
+  traderUsername: string;
+  traderScore: number;
+  reason: string;
 }
 
 export interface AgentAction {
@@ -236,10 +272,10 @@ export const DEFAULT_CONFIG: AgentConfig = {
   minConfidence: 0.6,
   modelId: "x-ai/grok-4.20-multi-agent-beta",
   ensembleModels: [
-    "x-ai/grok-4.20-multi-agent-beta",
-    "anthropic/claude-opus-4-6",
-    "openai/gpt-5.4",
     "deepseek/deepseek-v3.2",
+    "google/gemini-3-flash-preview",
+    "openai/gpt-5.4",
+    "anthropic/claude-sonnet-4-6",
   ],
   runIntervalMinutes: 15,
   enabled: true,

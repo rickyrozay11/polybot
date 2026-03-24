@@ -2,6 +2,11 @@ import OpenAI from "openai";
 import { LLMProvider, LLMMessage, LLMToolDefinition, LLMResponse, LLMToolCall } from "@/src/types";
 import { withRetry } from "@/src/lib/retry";
 
+/** Strip markdown code fences (```json ... ```) from LLM responses before parsing */
+export function stripCodeFences(text: string): string {
+  return text.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim();
+}
+
 // ============================================================================
 // MODEL CONFIGURATION
 // ============================================================================
@@ -24,26 +29,33 @@ export const MODELS: Record<string, ModelConfig> = {
     supportsToolCalling: false,
     costPer1kTokens: 0.005,
   },
-  claudeOpus: {
-    id: "anthropic/claude-opus-4-6",
-    name: "Claude Opus 4.6",
+  claudeSonnet: {
+    id: "anthropic/claude-sonnet-4-6",
+    name: "Claude Sonnet 4.6",
     tier: "heavy",
     supportsToolCalling: true,
-    costPer1kTokens: 0.015,
+    costPer1kTokens: 0.009,
   },
   gpt54: {
     id: "openai/gpt-5.4",
     name: "GPT 5.4",
     tier: "heavy",
     supportsToolCalling: true,
-    costPer1kTokens: 0.03,
+    costPer1kTokens: 0.009,
   },
   deepseekV32: {
     id: "deepseek/deepseek-v3.2",
     name: "Deepseek V3.2",
     tier: "heavy",
     supportsToolCalling: true,
-    costPer1kTokens: 0.004,
+    costPer1kTokens: 0.0003,
+  },
+  gemini3Flash: {
+    id: "google/gemini-3-flash-preview",
+    name: "Gemini 3 Flash",
+    tier: "heavy",
+    supportsToolCalling: true,
+    costPer1kTokens: 0.002,
   },
   grokBeta: {
     id: "x-ai/grok-4.20-beta",
@@ -277,7 +289,7 @@ function computeConsensus(
   for (const vote of votes) {
     try {
       // Attempt to parse content as JSON
-      const parsed = vote.response.content ? JSON.parse(vote.response.content) : {};
+      const parsed = vote.response.content ? JSON.parse(stripCodeFences(vote.response.content)) : {};
       parsedVotes.push({
         modelId: vote.modelId,
         action: parsed.action || parsed.recommendation || undefined,

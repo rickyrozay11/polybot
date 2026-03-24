@@ -8,6 +8,11 @@ import type {
   TradeDecision,
   ScreeningResult,
 } from "@/src/types";
+
+/** Strip markdown code fences from LLM responses before JSON.parse */
+function stripCodeFences(text: string): string {
+  return text.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim();
+}
 import { filterMarkets, scoreMarket } from "@/src/agent/market-scorer";
 import { checkRisk } from "@/src/agent/risk-manager";
 import {
@@ -19,6 +24,8 @@ import {
 
 export interface PipelineDeps {
   llm: LLMProvider;
+  /** LLM provider that supports tool calling (used for research stage). Falls back to `llm` if not set. */
+  toolLlm?: LLMProvider;
   scanner: {
     fetchTrendingMarkets: (limit?: number) => Promise<MarketCandidate[]>;
   };
@@ -107,7 +114,7 @@ export async function runPipeline(
       response_format: { type: "json_object" },
     });
 
-    const parsed = JSON.parse(screenResponse.content ?? "[]");
+    const parsed = JSON.parse(stripCodeFences(screenResponse.content ?? "[]"));
     // Handle various JSON wrappers the LLM might use
     let rawResults: Array<{
       conditionId: string;
@@ -224,7 +231,7 @@ export async function runPipeline(
       const decision: TradeDecision = {
         conditionId: market.conditionId,
         question: market.question,
-        ...JSON.parse(decisionResponse.content ?? "{}"),
+        ...JSON.parse(stripCodeFences(decisionResponse.content ?? "{}")),
       };
 
       if (decision.action === "skip") {
@@ -384,6 +391,9 @@ async function runResearchLoop(
   market: MarketCandidate,
   candidate: ScreeningResult
 ): Promise<string> {
+  // Use tool-capable LLM for research (falls back to default llm)
+  const researchLlm = deps.toolLlm ?? deps.llm;
+
   // Dynamically import tool registry (may not exist yet during development)
   let getToolDefinitions: () => LLMToolDefinition[];
   let executeToolCall: (
@@ -398,7 +408,7 @@ async function runResearchLoop(
     executeToolCall = toolRegistry.executeToolCall;
   } catch {
     // If tool registry not available, do a single-shot research synthesis
-    const response = await deps.llm.chat({
+    const response = await researchLlm.chat({
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         {
@@ -434,7 +444,7 @@ async function runResearchLoop(
 
   const MAX_ITERATIONS = 2;
   for (let i = 0; i < MAX_ITERATIONS; i++) {
-    const response = await deps.llm.chat({
+    const response = await researchLlm.chat({
       messages,
       tools,
       temperature: 0.4,

@@ -1,5 +1,5 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { streamText, UIMessage, convertToModelMessages, tool } from "ai";
+import { streamText, UIMessage, convertToModelMessages, tool, stepCountIs } from "ai";
 import { z } from "zod";
 
 export const maxDuration = 60;
@@ -12,7 +12,7 @@ const openrouter = createOpenAICompatible({
 
 // Multi-model chat routing
 const FAST_MODEL = "x-ai/grok-4.20-beta";
-const HEAVY_MODEL = "anthropic/claude-opus-4-6";
+const HEAVY_MODEL = "openai/gpt-5.4";
 
 function classifyComplexity(message: string): "fast" | "heavy" {
   const lower = message.toLowerCase();
@@ -97,7 +97,7 @@ Be concise and actionable. When showing market data, include prices as percentag
     tools: {
       get_trending_markets: tool({
         description: "Get the top trending prediction markets on Polymarket right now, sorted by volume. Returns market questions, prices, volume, and liquidity.",
-        parameters: z.object({
+        inputSchema: z.object({
           limit: z.number().optional().describe("Number of markets to return (default 10, max 50)"),
         }),
         execute: async ({ limit = 10 }) => {
@@ -127,7 +127,7 @@ Be concise and actionable. When showing market data, include prices as percentag
 
       get_market_details: tool({
         description: "Search for a specific Polymarket market by keyword or slug. Returns detailed info including prices, volume, outcomes, and token IDs.",
-        parameters: z.object({
+        inputSchema: z.object({
           query: z.string().describe("Market slug or search keyword (e.g. 'trump', 'bitcoin-100k', 'fed-rate')"),
         }),
         execute: async ({ query }: { query: string }) => {
@@ -168,7 +168,7 @@ Be concise and actionable. When showing market data, include prices as percentag
 
       get_orderbook: tool({
         description: "Get the live orderbook (bids, asks, spread, midpoint) for a Polymarket token. Requires a token ID.",
-        parameters: z.object({
+        inputSchema: z.object({
           token_id: z.string().describe("The CLOB token ID to get the orderbook for"),
         }),
         execute: async ({ token_id }: { token_id: string }) => {
@@ -193,7 +193,7 @@ Be concise and actionable. When showing market data, include prices as percentag
 
       get_leaderboard: tool({
         description: "Get the top traders on Polymarket ranked by profit or volume. Shows their PnL, volume, username, and rank.",
-        parameters: z.object({
+        inputSchema: z.object({
           period: z.enum(["DAY", "WEEK", "MONTH", "ALL"]).optional().describe("Time period (default 'WEEK')"),
           orderBy: z.enum(["PNL", "VOL"]).optional().describe("Sort by PNL (profit) or VOL (volume). Default PNL."),
           limit: z.number().optional().describe("Number of traders to return (default 25, max 100)"),
@@ -227,7 +227,7 @@ Be concise and actionable. When showing market data, include prices as percentag
 
       get_market_price: tool({
         description: "Get the current midpoint price for a Polymarket token by its token ID.",
-        parameters: z.object({
+        inputSchema: z.object({
           token_id: z.string().describe("The CLOB token ID"),
         }),
         execute: async ({ token_id }: { token_id: string }) => {
@@ -242,7 +242,7 @@ Be concise and actionable. When showing market data, include prices as percentag
         },
       }),
     },
-    maxSteps: 5,
+    stopWhen: stepCountIs(5),
     onStepFinish({ text, toolCalls, toolResults, finishReason, usage }) {
       console.log("[chat] Step finished:", {
         hasText: !!text?.trim(),

@@ -57,6 +57,16 @@ export const upsertTrader = mutation({
     compositeScore: v.float64(),
     source: v.union(v.literal("leaderboard"), v.literal("whale"), v.literal("manual")),
     enabled: v.boolean(),
+    roi: v.optional(v.float64()),
+    realWinRate: v.optional(v.float64()),
+    consistency: v.optional(v.float64()),
+    copyPnl: v.optional(v.float64()),
+    copyTradeCount: v.optional(v.float64()),
+    copyWinCount: v.optional(v.float64()),
+    decayedScore: v.optional(v.float64()),
+    avgHoldTime: v.optional(v.float64()),
+    lastTradeAt: v.optional(v.float64()),
+    disabledReason: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const existing = await ctx.db
@@ -90,6 +100,16 @@ export const internalUpsertTrader = internalMutation({
     compositeScore: v.float64(),
     source: v.union(v.literal("leaderboard"), v.literal("whale"), v.literal("manual")),
     enabled: v.boolean(),
+    roi: v.optional(v.float64()),
+    realWinRate: v.optional(v.float64()),
+    consistency: v.optional(v.float64()),
+    copyPnl: v.optional(v.float64()),
+    copyTradeCount: v.optional(v.float64()),
+    copyWinCount: v.optional(v.float64()),
+    decayedScore: v.optional(v.float64()),
+    avgHoldTime: v.optional(v.float64()),
+    lastTradeAt: v.optional(v.float64()),
+    disabledReason: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const existing = await ctx.db
@@ -222,5 +242,119 @@ export const recentTraderActivity = query({
       .withIndex("by_detectedAt")
       .order("desc")
       .take(args.limit ?? 50);
+  },
+});
+
+// ---- Trader Performance Attribution ----
+
+export const internalRecordCopyResult = internalMutation({
+  args: {
+    traderAddress: v.string(),
+    conditionId: v.string(),
+    question: v.string(),
+    side: v.union(v.literal("buy_yes"), v.literal("buy_no")),
+    copySize: v.float64(),
+    copyPrice: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    return await ctx.db.insert("traderPerformance", {
+      ...args,
+      status: "open",
+      openedAt: Date.now(),
+    });
+  },
+});
+
+export const internalCloseCopyResult = internalMutation({
+  args: {
+    conditionId: v.string(),
+    exitPrice: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    const records = await ctx.db
+      .query("traderPerformance")
+      .withIndex("by_conditionId", (q) => q.eq("conditionId", args.conditionId))
+      .filter((q) => q.eq(q.field("status"), "open"))
+      .collect();
+
+    for (const record of records) {
+      const multiplier = record.side === "buy_yes" ? 1 : -1;
+      const pnl = (args.exitPrice - record.copyPrice) * record.copySize * multiplier;
+
+      await ctx.db.patch(record._id, {
+        exitPrice: args.exitPrice,
+        pnl,
+        status: "closed",
+        closedAt: Date.now(),
+      });
+
+      // Update the trader's aggregate copy P&L
+      const trader = await ctx.db
+        .query("trackedTraders")
+        .withIndex("by_address", (q) => q.eq("address", record.traderAddress))
+        .first();
+
+      if (trader) {
+        const newCopyPnl = (trader.copyPnl ?? 0) + pnl;
+        const newCopyWinCount = (trader.copyWinCount ?? 0) + (pnl > 0 ? 1 : 0);
+        await ctx.db.patch(trader._id, {
+          copyPnl: newCopyPnl,
+          copyWinCount: newCopyWinCount,
+        });
+      }
+    }
+  },
+});
+
+export const internalIncrementCopyCount = internalMutation({
+  args: { address: v.string() },
+  handler: async (ctx, args) => {
+    const trader = await ctx.db
+      .query("trackedTraders")
+      .withIndex("by_address", (q) => q.eq("address", args.address))
+      .first();
+    if (trader) {
+      await ctx.db.patch(trader._id, {
+        copyTradeCount: (trader.copyTradeCount ?? 0) + 1,
+      });
+    }
+  },
+});
+
+export const getTraderPerformance = query({
+  args: { traderAddress: v.string() },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("traderPerformance")
+      .withIndex("by_traderAddress", (q) => q.eq("traderAddress", args.traderAddress))
+      .order("desc")
+      .take(50);
+  },
+});
+
+export const internalAutoDisableTrader = internalMutation({
+  args: { address: v.string(), reason: v.string() },
+  handler: async (ctx, args) => {
+    const trader = await ctx.db
+      .query("trackedTraders")
+      .withIndex("by_address", (q) => q.eq("address", args.address))
+      .first();
+    if (trader && trader.enabled) {
+      await ctx.db.patch(trader._id, {
+        enabled: false,
+        disabledReason: args.reason,
+      });
+    }
+  },
+});
+
+export const listTraderPerformance = query({
+  args: {},
+  handler: async (ctx) => {
+    return await ctx.db
+      .query("traderPerformance")
+      .withIndex("by_openedAt")
+      .order("desc")
+      .take(100);
   },
 });
