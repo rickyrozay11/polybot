@@ -136,8 +136,12 @@ export class MultiModelProvider implements LLMProvider {
       chatParams.response_format = params.response_format;
     }
 
+    const startMs = Date.now();
+    console.log(`[LLM:ensemble] ➜ ${modelId} | temp=${chatParams.temperature} | tools=${chatParams.tools?.length ?? 0}`);
+
     return withRetry(async () => {
       const response = await this.client.chat.completions.create(chatParams);
+      const latencyMs = Date.now() - startMs;
 
       const toolCalls: LLMToolCall[] = [];
       let content: string | null = null;
@@ -162,13 +166,16 @@ export class MultiModelProvider implements LLMProvider {
         }
       }
 
+      const tokens = (response.usage?.prompt_tokens ?? 0) + (response.usage?.completion_tokens ?? 0);
+      console.log(`[LLM:ensemble] ✓ ${modelId} | ${latencyMs}ms | ${tokens} tokens | response: "${(content ?? "").slice(0, 150)}${(content?.length ?? 0) > 150 ? "..." : ""}"`);
+
       return {
         content,
         tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
         usage: {
           prompt_tokens: response.usage?.prompt_tokens ?? 0,
           completion_tokens: response.usage?.completion_tokens ?? 0,
-          total_tokens: (response.usage?.prompt_tokens ?? 0) + (response.usage?.completion_tokens ?? 0),
+          total_tokens: tokens,
         },
       };
     });

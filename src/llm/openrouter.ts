@@ -61,6 +61,11 @@ export class OpenRouterProvider implements LLMProvider {
       },
     }));
 
+    const startMs = Date.now();
+    const userMsg = messages.find((m) => m.role === "user")?.content ?? "";
+    const promptPreview = userMsg.length > 120 ? userMsg.slice(0, 120) + "..." : userMsg;
+    console.log(`[LLM] ➜ ${this.modelId} | temp=${temperature ?? 0.7} | max_tokens=${max_tokens ?? "default"} | tools=${tools?.length ?? 0} | prompt: "${promptPreview}"`);
+
     const response = await withRetry(
       () =>
         this.client.chat.completions.create({
@@ -71,9 +76,10 @@ export class OpenRouterProvider implements LLMProvider {
           max_tokens,
           response_format,
         }),
-      { label: "openrouter-chat", maxRetries: 3 }
+      { label: `openrouter-${this.modelId}`, maxRetries: 3 }
     );
 
+    const latencyMs = Date.now() - startMs;
     const choice = response.choices[0];
     const message = choice.message;
 
@@ -99,6 +105,10 @@ export class OpenRouterProvider implements LLMProvider {
         total_tokens: response.usage.total_tokens,
       };
     }
+
+    const contentPreview = (result.content ?? "").slice(0, 200);
+    const toolCallNames = result.tool_calls?.map((tc) => tc.function.name).join(", ") ?? "none";
+    console.log(`[LLM] ✓ ${this.modelId} | ${latencyMs}ms | tokens: ${result.usage?.prompt_tokens ?? "?"}→${result.usage?.completion_tokens ?? "?"} (${result.usage?.total_tokens ?? "?"}) | tools: ${toolCallNames} | response: "${contentPreview}${(result.content?.length ?? 0) > 200 ? "..." : ""}"`);
 
     return result;
   }

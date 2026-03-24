@@ -60,6 +60,7 @@ export async function runPipeline(
   }
 
   // --- Stage 1: Scan ---
+  console.log(`[PIPELINE] Stage 1: Scanning trending markets...`);
   let allMarkets: MarketCandidate[];
   try {
     allMarkets = await deps.scanner.fetchTrendingMarkets(20);
@@ -80,7 +81,9 @@ export async function runPipeline(
   }
 
   // --- Stage 2: Filter ---
+  console.log(`[PIPELINE] Stage 2: Filtering ${allMarkets.length} markets...`);
   const filtered = filterMarkets(allMarkets, deps.existingPositionIds);
+  console.log(`[PIPELINE] ${allMarkets.length} → ${filtered.length} markets after filter`);
   await log({
     type: "filter",
     summary: `Filtered ${allMarkets.length} → ${filtered.length} markets`,
@@ -93,6 +96,7 @@ export async function runPipeline(
   }
 
   // --- Stage 3: LLM Screen ---
+  console.log(`[PIPELINE] Stage 3: LLM screening ${filtered.length} markets...`);
   let screenResults: ScreeningResult[] = [];
   try {
     const marketsForScreening = filtered.map((m) => {
@@ -175,6 +179,7 @@ export async function runPipeline(
   }
 
   // --- Stage 4 & 5: Deep Research + Trade Decision per market ---
+  console.log(`[PIPELINE] Stage 4+5: Research + decisions for ${screenResults.length} candidates`);
   for (const candidate of screenResults) {
     try {
       const market = filtered.find(
@@ -183,6 +188,7 @@ export async function runPipeline(
       if (!market) continue;
 
       // Stage 4: Deep Research via tool-calling loop
+      console.log(`[PIPELINE] Researching: "${market.question.slice(0, 60)}"`);
       const researchSynthesis = await runResearchLoop(
         deps,
         market,
@@ -202,6 +208,7 @@ export async function runPipeline(
       });
 
       // Stage 5: Trade Decision
+      console.log(`[PIPELINE] Research done (${researchSynthesis.length} chars). Making trade decision...`);
       const yesToken =
         market.tokens.find((t) => t.outcome === "Yes") ?? market.tokens[0];
       const noToken =

@@ -245,6 +245,25 @@ export const recentTraderActivity = query({
   },
 });
 
+// Returns composite keys of recently logged activity for deduplication.
+// Keys use the format: traderAddress:conditionId:side:size — matches deduplicateTrades().
+export const internalRecentTradeKeys = internalQuery({
+  args: { sinceMs: v.float64() },
+  handler: async (ctx, args) => {
+    const recent = await ctx.db
+      .query("traderActivity")
+      .withIndex("by_detectedAt")
+      .order("desc")
+      .take(500);
+
+    return recent
+      .filter((r) => r.detectedAt > args.sinceMs)
+      .map(
+        (r) => `${r.traderAddress}:${r.conditionId}:${r.side}:${r.size}`
+      );
+  },
+});
+
 // ---- Trader Performance Attribution ----
 
 export const internalRecordCopyResult = internalMutation({

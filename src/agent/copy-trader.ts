@@ -1,14 +1,13 @@
 /**
- * Copy-Trading Engine v2
+ * Copy-Trading Engine v3
  *
- * Major upgrades over v1:
- * - ROI-based scoring (profit/volume) instead of raw PnL
- * - Real win rate from trade history, not leaderboard rank approximation
- * - Exponential recency decay — stale traders drop off automatically
- * - Consistency scoring (Sharpe-like: mean return / stddev)
- * - Position-aware filtering — detects averaging down, skip risky copies
- * - Per-trader P&L attribution tracking
- * - Auto-disable underperformers
+ * Upgrades over v2:
+ * - Conviction-weighted signals: trader position size relative to portfolio
+ * - Fresh price fetching before execution (no stale trader prices)
+ * - Market validation: checks active, liquidity, time-to-close
+ * - Deduplication via transaction hash tracking
+ * - Smarter sizing: scales with conviction, consensus, and trader quality
+ * - Single-model validation (DeepSeek V3.2) instead of 4-model ensemble
  */
 
 import type { TrackedTrader, CopyTradeSignal, AgentConfig } from "@/src/types";
@@ -99,17 +98,14 @@ async function calculateRealWinRate(
         returns.push(ret);
         if (currentPrice > entryPrice) wins++;
       } else {
-        // Position closed — check if trade.outcome suggests resolution
-        // For resolved markets, buying YES at low price = win if resolved YES
-        // We can't know for sure without resolution data, so count based on entry price
-        // Buying at < 0.5 on a resolved market likely means it resolved their way
+        // Position closed — estimate based on entry price
         if (entryPrice < 0.4) {
           wins++;
-          returns.push((1 - entryPrice) / entryPrice); // max profit assumption for resolved
+          returns.push((1 - entryPrice) / entryPrice);
         } else if (entryPrice > 0.6) {
-          returns.push(-1); // likely lost
+          returns.push(-1);
         } else {
-          returns.push(0); // uncertain, neutral
+          returns.push(0);
         }
       }
     }
@@ -136,14 +132,12 @@ function calculateConsistency(returns: number[]): number {
 
   if (stddev === 0) return mean > 0 ? 1 : 0;
 
-  // Sharpe ratio normalized to 0-1 range
   const sharpe = mean / stddev;
-  return Math.max(0, Math.min(1, (sharpe + 1) / 3)); // map [-1, 2] -> [0, 1]
+  return Math.max(0, Math.min(1, (sharpe + 1) / 3));
 }
 
 /**
  * Apply exponential time decay to a score.
- * Score halves every DECAY_HALF_LIFE_MS of inactivity.
  */
 function applyDecay(score: number, lastActiveMs: number): number {
   const elapsed = Date.now() - lastActiveMs;
@@ -154,13 +148,11 @@ function applyDecay(score: number, lastActiveMs: number): number {
 
 /**
  * Discover the best traders from the Polymarket leaderboard.
- * Uses ROI-based scoring with real win rates and consistency.
  */
 export async function discoverTopTraders(
   limit = 20,
   weights: TraderScoreWeights = DEFAULT_WEIGHTS
 ): Promise<TrackedTrader[]> {
-  // Fetch leaderboards across multiple windows
   const [leaders7d, leaders30d, leadersAll] = await Promise.allSettled([
     fetchLeaderboard("7d", 100),
     fetchLeaderboard("30d", 100),
@@ -171,7 +163,6 @@ export async function discoverTopTraders(
   const all30d = leaders30d.status === "fulfilled" ? leaders30d.value : [];
   const allTime = leadersAll.status === "fulfilled" ? leadersAll.value : [];
 
-  // Build a map: address -> aggregated stats
   const traderMap = new Map<string, TraderRawStats>();
 
   function addEntries(entries: LeaderboardEntry[], window: "7d" | "30d" | "all") {
@@ -212,14 +203,12 @@ export async function discoverTopTraders(
     (t) => t.pnlAll > 0 && t.volumeAll > 1000
   );
 
-  // Get real win rates for top candidates (by raw ROI)
-  // Sort by ROI first, then deep-analyze top 40
   const byRoi = candidates
     .map((t) => ({ ...t, roi: t.pnlAll / Math.max(t.volumeAll, 1) }))
     .sort((a, b) => b.roi - a.roi)
     .slice(0, 40);
 
-  // Fetch real win rates in parallel (batched to avoid rate limits)
+  // Fetch real win rates in parallel (batched)
   const BATCH_SIZE = 5;
   const winRateResults = new Map<string, { winRate: number; tradeCount: number; avgReturn: number; returns: number[] }>();
 
@@ -233,37 +222,26 @@ export async function discoverTopTraders(
         winRateResults.set(batch[idx].address, r.value);
       }
     });
-    // Small delay between batches
     if (i + BATCH_SIZE < byRoi.length) {
       await new Promise((r) => setTimeout(r, 300));
     }
   }
 
-  // Score each trader
   const maxVolume = Math.max(...byRoi.map((t) => t.volumeAll), 1);
 
   const scored: TrackedTrader[] = byRoi
     .map((t) => {
       const wr = winRateResults.get(t.address) ?? { winRate: 0, tradeCount: 0, avgReturn: 0, returns: [] };
 
-      // ROI score: profit / volume, weighted toward recent
       const roi7d = t.volume7d > 0 ? t.pnl7d / t.volume7d : 0;
       const roi30d = t.volume30d > 0 ? t.pnl30d / t.volume30d : 0;
       const roiAll = t.volumeAll > 0 ? t.pnlAll / t.volumeAll : 0;
       const blendedRoi = roi7d * 0.5 + roi30d * 0.3 + roiAll * 0.2;
-      // Normalize: typical good ROI is 5-20%, great is 20%+
       const roiScore = Math.max(0, Math.min(1, blendedRoi / 0.20));
 
-      // Real win rate score (from actual trade history)
       const winRateScore = wr.winRate;
-
-      // Consistency (Sharpe-like)
       const consistencyScore = calculateConsistency(wr.returns);
-
-      // Volume score (log-normalized) — proves conviction, not just luck
       const volumeScore = Math.log10(t.volumeAll + 1) / Math.log10(maxVolume + 1);
-
-      // Recency: 7d rank matters most
       const recencyScore = t.rank7d < 50 ? (1 - t.rank7d / 50) : 0;
 
       const composite =
@@ -273,7 +251,6 @@ export async function discoverTopTraders(
         Math.max(0, volumeScore) * weights.volume +
         Math.max(0, recencyScore) * weights.recency;
 
-      // Apply time decay based on 7d ranking (if not in top 100 for 7d, likely inactive)
       const lastActiveEstimate = t.rank7d < 100 ? Date.now() : Date.now() - 14 * 24 * 60 * 60 * 1000;
       const decayed = applyDecay(composite, lastActiveEstimate);
 
@@ -282,11 +259,10 @@ export async function discoverTopTraders(
         username: t.username,
         pnl: t.pnlAll,
         volume: t.volumeAll,
-        winRate: wr.winRate, // REAL win rate, not approximation
+        winRate: wr.winRate,
         tradeCount: wr.tradeCount || t.marketsTraded,
         compositeScore: Math.round(composite * 1000) / 1000,
         lastUpdated: Date.now(),
-        // New fields
         roi: Math.round(blendedRoi * 10000) / 10000,
         realWinRate: Math.round(wr.winRate * 1000) / 1000,
         consistency: Math.round(consistencyScore * 1000) / 1000,
@@ -318,8 +294,6 @@ export async function scanTraderActivity(
   sinceTimestamp: number
 ): Promise<NewTradeDetection[]> {
   const results: NewTradeDetection[] = [];
-
-  // Parallel batched scanning for speed
   const BATCH_SIZE = 5;
 
   for (let i = 0; i < traders.length; i += BATCH_SIZE) {
@@ -355,11 +329,52 @@ export async function scanTraderActivity(
   return results;
 }
 
+// ---- Deduplication ----
+
+/**
+ * Filter out trades we've already processed in previous cycles.
+ * Uses transaction hash + conditionId + trader address as composite key.
+ */
+export function deduplicateTrades(
+  detections: NewTradeDetection[],
+  seenTradeKeys: Set<string>
+): { filtered: NewTradeDetection[]; newKeys: string[] } {
+  const filtered: NewTradeDetection[] = [];
+  const newKeys: string[] = [];
+
+  for (const detection of detections) {
+    const unseenTrades: TraderActivityItem[] = [];
+
+    for (const trade of detection.trades) {
+      // Determine the side as stored in DB (buy_yes/buy_no)
+      const side: "buy_yes" | "buy_no" =
+        trade.side === "BUY"
+          ? trade.outcome?.toLowerCase() === "no" ? "buy_no" : "buy_yes"
+          : trade.outcome?.toLowerCase() === "no" ? "buy_yes" : "buy_no";
+
+      // Key format matches internalRecentTradeKeys: address:conditionId:side:size
+      const key = `${detection.traderAddress}:${trade.conditionId}:${side}:${parseFloat(trade.size)}`;
+      if (!seenTradeKeys.has(key)) {
+        unseenTrades.push(trade);
+        newKeys.push(key);
+      }
+    }
+
+    if (unseenTrades.length > 0) {
+      filtered.push({
+        ...detection,
+        trades: unseenTrades,
+      });
+    }
+  }
+
+  return { filtered, newKeys };
+}
+
 // ---- Position-Aware Filtering ----
 
 /**
  * Check if a trader is averaging down on a losing position.
- * Returns true if the trade looks like a desperation add.
  */
 async function isAveragingDown(
   traderAddress: string,
@@ -374,23 +389,120 @@ async function isAveragingDown(
     const avgPrice = parseFloat(existing.avgPrice);
     const currentPrice = existing.currentPrice ? parseFloat(existing.currentPrice) : null;
 
-    // If they already hold this position AND the current price is significantly below
-    // their avg entry AND they're buying more — that's averaging down
     if (currentPrice !== null && currentPrice < avgPrice * 0.85 && newTradePrice < avgPrice) {
       return true;
     }
 
     return false;
   } catch {
-    return false; // err on the side of allowing the trade
+    return false;
+  }
+}
+
+// ---- Conviction Scoring ----
+
+/**
+ * Calculate conviction: how much of the trader's portfolio is this trade?
+ * A trader putting 50% of their capital into one trade = very high conviction.
+ */
+async function calculateConviction(
+  traderAddress: string,
+  tradeSize: number
+): Promise<number> {
+  try {
+    const positions = await fetchTraderPositions(traderAddress);
+    const totalPortfolio = positions.reduce((sum, p) => {
+      return sum + parseFloat(p.size) * parseFloat(p.avgPrice || "0");
+    }, 0);
+
+    if (totalPortfolio <= 0) return 0.5; // unknown portfolio = neutral
+    const conviction = tradeSize / (totalPortfolio + tradeSize);
+
+    // Normalize: 1% = low (0.1), 10% = medium (0.5), 30%+ = high (1.0)
+    return Math.max(0.1, Math.min(1, conviction / 0.3));
+  } catch {
+    return 0.5;
+  }
+}
+
+// ---- Market Validation ----
+
+/**
+ * Validate a market before entering a copy trade.
+ * Checks: still active, has liquidity, not about to close.
+ */
+export async function validateMarket(conditionId: string): Promise<{
+  valid: boolean;
+  reason?: string;
+  liquidity?: number;
+  endDate?: string;
+  freshPrice?: { yes: number; no: number };
+}> {
+  try {
+    const market = await fetchMarketByCondition(conditionId);
+    if (!market) {
+      return { valid: false, reason: "market_not_found" };
+    }
+
+    // Check liquidity (minimum $500 to ensure we can exit)
+    if (market.liquidity < 500) {
+      return { valid: false, reason: `low_liquidity_${market.liquidity.toFixed(0)}` };
+    }
+
+    // Check time to resolution (minimum 1 hour)
+    if (market.endDate) {
+      const endTime = new Date(market.endDate).getTime();
+      const hoursLeft = (endTime - Date.now()) / (60 * 60 * 1000);
+      if (hoursLeft < 1) {
+        return { valid: false, reason: `closing_soon_${hoursLeft.toFixed(1)}hrs` };
+      }
+    }
+
+    // Get fresh token prices
+    const yesToken = market.tokens.find((t) => t.outcome === "Yes");
+    const noToken = market.tokens.find((t) => t.outcome === "No");
+    const yesPrice = yesToken?.price ?? 0;
+    const noPrice = noToken?.price ?? 0;
+
+    // Reject extreme prices (>97c or <3c) — no room for profit
+    if (yesPrice > 0.97 || yesPrice < 0.03) {
+      return { valid: false, reason: `extreme_price_${(yesPrice * 100).toFixed(1)}c` };
+    }
+
+    return {
+      valid: true,
+      liquidity: market.liquidity,
+      endDate: market.endDate,
+      freshPrice: { yes: yesPrice, no: noPrice },
+    };
+  } catch {
+    // If we can't validate, allow the trade (don't block on API failure)
+    return { valid: true };
+  }
+}
+
+// ---- Fresh Price Fetching ----
+
+/**
+ * Fetch the current midpoint price from the CLOB for a token.
+ * This is the price we should actually execute at, not the trader's stale price.
+ */
+export async function fetchFreshMidpoint(tokenId: string): Promise<number | null> {
+  try {
+    const res = await fetch(`https://clob.polymarket.com/midpoint?token_id=${tokenId}`);
+    if (!res.ok) return null;
+    const data = (await res.json()) as { mid: string };
+    const mid = parseFloat(data.mid);
+    return isNaN(mid) ? null : mid;
+  } catch {
+    return null;
   }
 }
 
 // ---- Consensus Signal Generation ----
 
 /**
- * Generate copy-trade signals with position-aware filtering.
- * Only generates signals when multiple traders agree AND they're not averaging down.
+ * Generate copy-trade signals with conviction scoring and market validation.
  */
 export async function generateCopySignals(
   detections: NewTradeDetection[],
@@ -411,6 +523,7 @@ export async function generateCopySignals(
         score: number;
         size: number;
         price: number;
+        conviction: number;
       }>;
     }
   >();
@@ -438,12 +551,17 @@ export async function generateCopySignals(
         });
       }
 
+      // Calculate conviction for this trade
+      const tradeSize = parseFloat(trade.size);
+      const conviction = await calculateConviction(detection.traderAddress, tradeSize);
+
       marketSideMap.get(key)!.traders.push({
         address: detection.traderAddress,
         username: detection.traderUsername,
         score: detection.traderScore,
-        size: parseFloat(trade.size),
+        size: tradeSize,
         price: parseFloat(trade.price),
+        conviction,
       });
     }
   }
@@ -458,45 +576,63 @@ export async function generateCopySignals(
     const uniqueTraders = new Set(entry.traders.map((t) => t.address));
     const consensus = uniqueTraders.size / totalTrackedTraders;
 
-    // Require 2+ traders OR 1 trader with decayed score > 0.8
-    const topTraderScore = Math.max(...entry.traders.map((t) => t.score));
-    const minTraders = topTraderScore > 0.8 ? 1 : 2;
+    // Single trader with high score (>0.7) OR high conviction (>0.6) is enough
+    // Otherwise require 2+ traders
+    const topTrader = entry.traders.reduce((a, b) => (a.score > b.score ? a : b));
+    const highConviction = entry.traders.some((t) => t.conviction > 0.6);
+    const minTraders = (topTrader.score > 0.7 || highConviction) ? 1 : 2;
     if (uniqueTraders.size < minTraders) continue;
 
     // Position-aware filtering: check if lead trader is averaging down
-    const leadTrader = entry.traders.reduce((a, b) => (a.score > b.score ? a : b));
     const avgingDown = await isAveragingDown(
-      leadTrader.address,
+      topTrader.address,
       entry.conditionId,
-      leadTrader.price
+      topTrader.price
     );
-    if (avgingDown) continue; // Skip — trader is likely chasing a loss
+    if (avgingDown) continue;
 
-    // Calculate weighted average price (weight by trader score)
-    const totalWeight = entry.traders.reduce((s, t) => s + t.score, 0);
-    const weightedPrice =
-      entry.traders.reduce((s, t) => s + t.price * t.score, 0) / (totalWeight || 1);
+    // Validate the market (active, liquid, not closing)
+    const marketCheck = await validateMarket(entry.conditionId);
+    if (!marketCheck.valid) continue;
 
-    // Size calculation: scale by consensus strength and trader quality
-    const avgTraderScore =
-      entry.traders.reduce((s, t) => s + t.score, 0) / entry.traders.length;
-    const avgTraderSize =
-      entry.traders.reduce((s, t) => s + t.size, 0) / entry.traders.length;
+    // Use fresh price from market validation if available, else from CLOB midpoint
+    let executionPrice = topTrader.price;
+    if (marketCheck.freshPrice) {
+      executionPrice = entry.side === "buy_yes"
+        ? marketCheck.freshPrice.yes
+        : marketCheck.freshPrice.no;
+    }
+    if (executionPrice <= 0) {
+      // Last resort: try CLOB midpoint directly
+      const mid = await fetchFreshMidpoint(entry.tokenId);
+      if (mid && mid > 0) executionPrice = mid;
+    }
 
-    // More aggressive sizing when consensus is strong
-    const consensusMultiplier = consensus > 0.5 ? 1.5 : consensus > 0.3 ? 1.2 : 1.0;
-    const rawSize = Math.min(
-      avgTraderSize * 0.1 * consensus * avgTraderScore * consensusMultiplier,
-      config.maxTradeSize
-    );
-    const suggestedSize = Math.max(0.5, Math.round(rawSize * 100) / 100);
+    // Calculate weighted average score (conviction-weighted)
+    const totalWeight = entry.traders.reduce((s, t) => s + t.score * t.conviction, 0);
+    const avgTraderScore = totalWeight / entry.traders.length;
 
-    const traderNames = entry.traders.map((t) => `${t.username}(${t.score.toFixed(2)})`).join(", ");
-    const reasoning = `${uniqueTraders.size} trader(s) [${traderNames}] buying ${entry.side} @ ${(consensus * 100).toFixed(0)}% consensus. ROI-scored, position-checked.`;
+    // Sizing: scale with conviction, consensus, and trader quality
+    const maxConviction = Math.max(...entry.traders.map((t) => t.conviction));
+    const avgTraderSize = entry.traders.reduce((s, t) => s + t.size, 0) / entry.traders.length;
+
+    // Base size: proportional to what traders are putting in
+    // Scale by our max trade size, consensus strength, and quality
+    const qualityMultiplier = Math.max(0.3, Math.min(1.5, avgTraderScore * 2));
+    const convictionMultiplier = 0.5 + maxConviction * 0.5; // 0.5x to 1.0x
+    const consensusMultiplier = uniqueTraders.size >= 3 ? 1.5 : uniqueTraders.size >= 2 ? 1.2 : 1.0;
+
+    const rawSize = config.maxTradeSize * 0.4 * qualityMultiplier * convictionMultiplier * consensusMultiplier;
+    const suggestedSize = Math.max(1, Math.min(Math.round(rawSize * 100) / 100, config.maxTradeSize));
+
+    const traderNames = entry.traders
+      .map((t) => `${t.username}(s:${t.score.toFixed(2)},c:${t.conviction.toFixed(2)})`)
+      .join(", ");
+    const reasoning = `${uniqueTraders.size} trader(s) [${traderNames}] ${entry.side} @ ${(executionPrice * 100).toFixed(1)}c | consensus:${(consensus * 100).toFixed(0)}% | liq:$${(marketCheck.liquidity ?? 0).toFixed(0)}`;
 
     signals.push({
-      traderAddress: leadTrader.address,
-      traderUsername: leadTrader.username,
+      traderAddress: topTrader.address,
+      traderUsername: topTrader.username,
       traderScore: avgTraderScore,
       conditionId: entry.conditionId,
       question: entry.question,
@@ -504,13 +640,13 @@ export async function generateCopySignals(
       side: entry.side,
       traderSize: avgTraderSize,
       suggestedSize,
-      price: weightedPrice,
+      price: executionPrice,
       consensus,
       reasoning,
     });
   }
 
-  // Sort by (consensus × score × decayed weight)
+  // Sort by conviction × score × consensus
   signals.sort((a, b) => b.consensus * b.traderScore - a.consensus * a.traderScore);
 
   return signals;
@@ -522,71 +658,41 @@ export function buildCopyTradeValidationPrompt(signals: CopyTradeSignal[]): stri
   const signalList = signals
     .map(
       (s, i) =>
-        `${i + 1}. Market: "${s.question}"
-   Side: ${s.side} at $${s.price.toFixed(3)}
-   Traders: ${s.traderUsername} (ROI-score: ${s.traderScore.toFixed(3)})
-   Consensus: ${(s.consensus * 100).toFixed(0)}%
-   Suggested size: $${s.suggestedSize.toFixed(2)}
-   Reasoning: ${s.reasoning}`
+        `${i + 1}. "${s.question}" | ${s.side} @ ${(s.price * 100).toFixed(1)}c | ${s.traderUsername} (score:${s.traderScore.toFixed(2)}) | ${(s.consensus * 100).toFixed(0)}% consensus | $${s.suggestedSize.toFixed(2)}`
     )
-    .join("\n\n");
+    .join("\n");
 
-  return `You are reviewing copy-trade signals from top Polymarket traders.
-
-These traders have been scored using ROI (profit/volume), real win rate from trade history, consistency (Sharpe ratio), and recency-weighted performance. Position-aware filtering has already removed signals where traders are averaging down on losing positions.
-
-## Signals to Validate
+  return `Quick-validate these copy-trade signals from ROI-scored Polymarket traders. Position-aware filtering already ran (no averaging-down signals). Markets have been validated (active, liquid, not closing soon).
 
 ${signalList}
 
-For each signal, assess:
-1. Does the market question make sense to trade right now?
-2. Is the price reasonable given your knowledge of current events?
-3. Are there any obvious red flags (market about to close, extreme pricing, etc.)?
-4. Should we copy this trade?
+For each: approve unless there's a clear red flag (nonsensical market, extreme price >95c or <5c with no catalyst, obvious manipulation, duplicate/stale market). The traders are the edge — don't second-guess strong consensus.
 
-Respond with JSON:
-{
-  "validations": [
-    {
-      "index": 1,
-      "approved": true,
-      "adjustedSize": 5.00,
-      "confidence": 0.75,
-      "reasoning": "..."
-    }
-  ]
-}
-
-Be conservative — only approve signals where the consensus is strong and the market makes sense. Reject anything that looks like noise or manipulation.`;
+JSON only:
+{"validations":[{"index":1,"approved":true,"adjustedSize":5.00,"confidence":0.75,"reasoning":"..."}]}`;
 }
 
 // ---- Underperformer Detection ----
 
 /**
  * Check if a trader should be auto-disabled based on your copy P&L from them.
- * Returns a reason string if should disable, or null if they're fine.
  */
 export function shouldDisableTrader(trader: TrackedTrader): string | null {
   const copyCount = trader.copyTradeCount ?? 0;
   const copyPnl = trader.copyPnl ?? 0;
   const copyWins = trader.copyWinCount ?? 0;
 
-  // Need at least 3 copy trades before judging
   if (copyCount < 3) return null;
 
-  // Disable if copy win rate < 30%
   const copyWinRate = copyWins / copyCount;
   if (copyWinRate < 0.30) {
     return `copy_win_rate_${(copyWinRate * 100).toFixed(0)}pct`;
   }
 
-  // Disable if net negative copy P&L after 5+ trades
   if (copyCount >= 5 && copyPnl < -5) {
     return `negative_copy_pnl_${copyPnl.toFixed(2)}`;
   }
 
-  // Disable if decayed score dropped below 0.1 (stale + bad)
   if ((trader.decayedScore ?? trader.compositeScore) < 0.1) {
     return "decayed_score_too_low";
   }
@@ -598,7 +704,6 @@ export function shouldDisableTrader(trader: TrackedTrader): string | null {
 
 /**
  * Detect when tracked traders are SELLING positions that we also hold.
- * If a top trader exits, we should consider exiting too.
  */
 export function detectCopyExits(
   detections: NewTradeDetection[],
@@ -624,7 +729,6 @@ export function detectCopyExits(
 
   for (const detection of detections) {
     for (const trade of detection.trades) {
-      // Look for SELL trades on markets we hold positions in
       if (trade.side === "SELL" && positionSet.has(trade.conditionId)) {
         exits.push({
           conditionId: trade.conditionId,

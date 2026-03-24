@@ -28,6 +28,21 @@ export const runAgentCycle = internalAction({
       return;
     }
 
+    // Skip autonomous trading if copy-trade-only mode is on
+    const copyTradeOnlyEntry = await ctx.runQuery(
+      internal.config.internalGetConfig,
+      { key: "copyTradeOnly" }
+    );
+    if (copyTradeOnlyEntry?.value === "true") {
+      await ctx.runMutation(internal.agentActions.internalLogAction, {
+        type: "scan",
+        summary: "Agent cycle skipped: copy-trade-only mode enabled",
+        details: {},
+        timestamp: Date.now(),
+      });
+      return;
+    }
+
     // Check wallet exists and has funds
     const wallet = await ctx.runQuery(internal.wallet.internalGetWallet);
     if (!wallet) {
@@ -113,6 +128,13 @@ export const runAgentCycle = internalAction({
         dryRun: dryRunEntry ? dryRunEntry.value === "true" : true,
         availableBalance: wallet.balance,
       };
+
+      console.log(`\n${"=".repeat(60)}`);
+      console.log(`[AGENT] Cycle ${cycleId} started | balance: $${wallet.balance.toFixed(2)} | dryRun: ${config.dryRun}`);
+      console.log(`[AGENT] Main LLM: ${config.modelId}`);
+      console.log(`[AGENT] Research LLM: deepseek/deepseek-v3.2`);
+      console.log(`[AGENT] Ensemble: deepseek-v3.2, gemini-3-flash, gpt-5.4, claude-sonnet-4-6`);
+      console.log(`${"=".repeat(60)}`);
 
       const llm = new OpenRouterProvider({
         apiKey: process.env.OPENROUTER_API_KEY!,
@@ -445,6 +467,9 @@ export const runCopyTradeCycle = internalAction({
     if (!wallet || wallet.balance < 0.5) return;
 
     const cycleId = `copy-${Date.now()}`;
+    console.log(`\n${"=".repeat(60)}`);
+    console.log(`[COPY TRADE] Cycle ${cycleId} started | balance: $${wallet.balance.toFixed(2)}`);
+    console.log(`${"=".repeat(60)}`);
 
     await ctx.runMutation(internal.agentActions.internalLogAction, {
       type: "copy_trade_scan",
@@ -455,10 +480,9 @@ export const runCopyTradeCycle = internalAction({
     });
 
     try {
-      const { discoverTopTraders, scanTraderActivity, generateCopySignals, buildCopyTradeValidationPrompt, shouldDisableTrader, detectCopyExits } =
+      const { discoverTopTraders, scanTraderActivity, generateCopySignals, buildCopyTradeValidationPrompt, shouldDisableTrader, detectCopyExits, deduplicateTrades, fetchFreshMidpoint } =
         await import("../src/agent/copy-trader");
       const { OpenRouterProvider } = await import("../src/llm/openrouter");
-      const { SYSTEM_PROMPT } = await import("../src/agent/prompts");
 
       // Read config
       const modelEntry = await ctx.runQuery(internal.config.internalGetConfig, { key: "modelId" });
@@ -478,12 +502,8 @@ export const runCopyTradeCycle = internalAction({
         availableBalance: wallet.balance,
       };
 
-      const llm = new OpenRouterProvider({
-        apiKey: process.env.OPENROUTER_API_KEY!,
-        modelId: config.modelId,
-      });
-
       // Step 1: Get or refresh tracked traders
+      console.log(`[COPY TRADE] Step 1: Loading tracked traders...`);
       let trackedTraders = await ctx.runQuery(internal.trackedTraders.internalEnabledTraders, {});
 
       // Refresh from leaderboard every cycle (or if no traders tracked yet)
@@ -543,6 +563,7 @@ export const runCopyTradeCycle = internalAction({
       }
 
       // Step 2: Scan for new activity (last 20 minutes to overlap with cron interval)
+      console.log(`[COPY TRADE] Step 2: Scanning ${trackedTraders.length} traders for new activity...`);
       const sinceTimestamp = Date.now() - 20 * 60 * 1000;
       const tradersForScan = trackedTraders.map((t) => ({
         address: t.address,
@@ -555,9 +576,9 @@ export const runCopyTradeCycle = internalAction({
         lastUpdated: t.lastUpdated,
       }));
 
-      const detections = await scanTraderActivity(tradersForScan, sinceTimestamp);
+      const rawDetections = await scanTraderActivity(tradersForScan, sinceTimestamp);
 
-      if (detections.length === 0) {
+      if (rawDetections.length === 0) {
         await ctx.runMutation(internal.agentActions.internalLogAction, {
           type: "copy_trade_scan",
           summary: `No new trades detected from ${trackedTraders.length} tracked traders`,
@@ -568,8 +589,28 @@ export const runCopyTradeCycle = internalAction({
         return;
       }
 
-      // Log detected activity
+      console.log(`[COPY TRADE] Detected ${rawDetections.reduce((s, d) => s + d.trades.length, 0)} raw trades from ${rawDetections.length} traders`);
+      // Deduplicate: filter out trades we already processed in previous cycles
+      const recentKeys = await ctx.runQuery(internal.trackedTraders.internalRecentTradeKeys, {
+        sinceMs: sinceTimestamp,
+      });
+      const seenSet = new Set(recentKeys);
+      const { filtered: detections, newKeys } = deduplicateTrades(rawDetections, seenSet);
+
+      if (detections.length === 0) {
+        await ctx.runMutation(internal.agentActions.internalLogAction, {
+          type: "copy_trade_scan",
+          summary: `All ${rawDetections.reduce((s, d) => s + d.trades.length, 0)} detected trades already processed (dedup)`,
+          details: { cycleId, rawTrades: rawDetections.reduce((s, d) => s + d.trades.length, 0) },
+          timestamp: Date.now(),
+          cycleId,
+        });
+        return;
+      }
+
+      // Log detected activity (after dedup)
       const totalNewTrades = detections.reduce((s, d) => s + d.trades.length, 0);
+      console.log(`[COPY TRADE] After dedup: ${totalNewTrades} new trades from ${detections.length} traders`);
       await ctx.runMutation(internal.agentActions.internalLogAction, {
         type: "copy_trade_scan",
         summary: `Detected ${totalNewTrades} new trades from ${detections.length} traders`,
@@ -671,88 +712,33 @@ export const runCopyTradeCycle = internalAction({
         return;
       }
 
-      // Step 4: Ensemble LLM validation (multi-model consensus)
-      const { EnsembleProvider: EP } = await import("../src/llm/multi-model-provider");
-      const ensembleModelIds = [
-        "deepseek/deepseek-v3.2",
-        "google/gemini-3-flash-preview",
-        "openai/gpt-5.4",
-        "anthropic/claude-sonnet-4-6",
-      ];
-      const ensemble = new EP({
+      // Step 4: Single-model LLM validation
+      console.log(`[COPY TRADE] Step 4: LLM validation for ${signals.length} signals...`);
+      const COPY_TRADE_MODEL = "deepseek/deepseek-v3.2";
+      const validator = new OpenRouterProvider({
         apiKey: process.env.OPENROUTER_API_KEY!,
-        modelIds: ensembleModelIds,
+        modelId: COPY_TRADE_MODEL,
       });
 
       const validationPrompt = buildCopyTradeValidationPrompt(signals);
+      const startMs = Date.now();
 
-      // Run ensemble validation - all 4 models vote on the signals
-      const ensembleResult = await ensemble.chatEnsemble({
+      const llmResult = await validator.chat({
         messages: [
-          { role: "system", content: SYSTEM_PROMPT },
+          {
+            role: "system",
+            content: "You are a copy-trade signal validator for Polymarket. Be fast and decisive. The traders are the edge — only reject signals with clear red flags. Respond with JSON only.",
+          },
           { role: "user", content: validationPrompt },
         ],
-        temperature: 0.2,
+        temperature: 0.1,
+        max_tokens: 1000,
         response_format: { type: "json_object" },
       });
 
-      await ctx.runMutation(internal.agentActions.internalLogAction, {
-        type: "ensemble_vote",
-        summary: `Ensemble validation: ${ensembleResult.consensus.agreementLevel} agreement on ${signals.length} signals (${ensembleResult.votes.length} models voted)`,
-        details: {
-          cycleId,
-          agreementLevel: ensembleResult.consensus.agreementLevel,
-          consensusAction: ensembleResult.consensus.action,
-          consensusConfidence: ensembleResult.consensus.confidence,
-          voteCounts: ensembleResult.consensus.voteCounts,
-          modelResults: ensembleResult.votes.map(v => ({
-            modelId: v.modelId,
-            latencyMs: v.latencyMs,
-            hasContent: !!v.response.content,
-          })),
-        },
-        timestamp: Date.now(),
-        cycleId,
-      });
+      const validationLatency = Date.now() - startMs;
 
-      // Record ensemble vote to the dedicated ensembleVotes table
-      const copyTradeParsedVotes = ensembleResult.votes.map((v) => {
-        try {
-          const parsed = JSON.parse(stripCodeFences(v.response.content ?? "{}"));
-          return {
-            modelId: v.modelId,
-            action: (parsed.action ?? "skip") as "buy_yes" | "buy_no" | "skip",
-            confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0.5,
-            reasoning: parsed.reasoning ?? "",
-            latencyMs: v.latencyMs,
-          };
-        } catch {
-          return {
-            modelId: v.modelId,
-            action: "skip" as const,
-            confidence: 0,
-            reasoning: "Failed to parse response",
-            latencyMs: v.latencyMs,
-          };
-        }
-      });
-
-      // Write one ensembleVotes record per signal (or one aggregate if signals share a market)
-      const firstSignal = signals[0];
-      if (firstSignal) {
-        await ctx.runMutation(internal.agentActions.internalRecordEnsembleVote, {
-          cycleId,
-          conditionId: firstSignal.conditionId,
-          question: firstSignal.question,
-          votes: copyTradeParsedVotes,
-          consensusAction: ensembleResult.consensus.action,
-          consensusConfidence: ensembleResult.consensus.confidence,
-          agreementLevel: ensembleResult.consensus.agreementLevel,
-          createdAt: Date.now(),
-        });
-      }
-
-      // Parse individual model validations and merge into consensus
+      // Parse validations from the single model response
       let validations: Array<{
         index: number;
         approved: boolean;
@@ -761,39 +747,50 @@ export const runCopyTradeCycle = internalAction({
         reasoning?: string;
       }> = [];
 
-      // Use the first successful model's structured response for per-signal validations
-      for (const vote of ensembleResult.votes) {
-        try {
-          const parsed = JSON.parse(stripCodeFences(vote.response.content ?? "{}"));
-          const vList = parsed.validations ?? parsed.data ?? parsed.results ?? [];
-          if (vList.length > 0) {
-            // Apply ensemble consensus confidence as a multiplier
-            validations = vList.map((v: any) => ({
-              ...v,
-              approved: v.approved && ensembleResult.consensus.agreementLevel !== "none",
-              confidence: Math.min(v.confidence ?? 0.7, ensembleResult.consensus.confidence ?? 0.5),
-              reasoning: `[Ensemble: ${ensembleResult.consensus.agreementLevel}] ${v.reasoning ?? ""}`,
-            }));
-            break;
-          }
-        } catch {
-          continue;
+      try {
+        const parsed = JSON.parse(stripCodeFences(llmResult.content ?? "{}"));
+        const vList = parsed.validations ?? parsed.data ?? parsed.results ?? [];
+        if (vList.length > 0) {
+          validations = vList.map((v: any) => ({
+            index: v.index,
+            approved: v.approved ?? true,
+            adjustedSize: v.adjustedSize,
+            confidence: v.confidence ?? 0.7,
+            reasoning: v.reasoning ?? "",
+          }));
         }
+      } catch {
+        // LLM failed to produce parseable JSON
       }
 
-      // Fallback if no model produced parseable validations
+      console.log(`[COPY TRADE] LLM (${COPY_TRADE_MODEL}) responded in ${validationLatency}ms | parsed ${validations.length} validations`);
+
+      // Fallback: approve all signals if LLM parsing failed (traders are the edge)
       if (validations.length === 0) {
-        const ensembleApproved = ensembleResult.consensus.agreementLevel !== "none" &&
-                                  ensembleResult.consensus.agreementLevel !== "weak";
         validations = signals.map((_, i) => ({
           index: i + 1,
-          approved: ensembleApproved,
-          confidence: ensembleResult.consensus.confidence,
-          reasoning: `Ensemble ${ensembleResult.consensus.agreementLevel} consensus (no structured per-signal validation available)`,
+          approved: true,
+          confidence: 0.7,
+          reasoning: "Auto-approved (LLM validation unavailable, trader consensus is primary signal)",
         }));
       }
 
+      await ctx.runMutation(internal.agentActions.internalLogAction, {
+        type: "copy_trade_scan",
+        summary: `LLM validation (${COPY_TRADE_MODEL}): ${validations.filter((v) => v.approved).length}/${signals.length} approved in ${validationLatency}ms`,
+        details: {
+          cycleId,
+          model: COPY_TRADE_MODEL,
+          latencyMs: validationLatency,
+          validations: validations.map((v) => ({ index: v.index, approved: v.approved, confidence: v.confidence })),
+        },
+        timestamp: Date.now(),
+        cycleId,
+      });
+
       // Step 5: Execute approved signals
+      const approvedCount = validations.filter((v) => v.approved).length;
+      console.log(`[COPY TRADE] Step 5: Executing ${approvedCount}/${signals.length} approved signals...`);
       let executedCount = 0;
       let cycleBalance = wallet.balance;
 
@@ -828,7 +825,29 @@ export const runCopyTradeCycle = internalAction({
           validation.adjustedSize ?? signal.suggestedSize,
           config.maxTradeSize
         );
-        const tradeCost = finalSize * signal.price;
+
+        // Fetch fresh price right before execution — don't use stale trader price
+        const freshPrice = await fetchFreshMidpoint(signal.tokenId);
+        const executionPrice = freshPrice ?? signal.price;
+
+        // Reject if price has moved significantly against us (>5% worse than signal)
+        const priceDrift = Math.abs(executionPrice - signal.price) / signal.price;
+        if (priceDrift > 0.05) {
+          await ctx.runMutation(internal.trackedTraders.internalUpdateSignalStatus, {
+            signalId,
+            status: "skipped",
+          });
+          await ctx.runMutation(internal.agentActions.internalLogAction, {
+            type: "copy_trade_scan",
+            summary: `Skipped signal: price drifted ${(priceDrift * 100).toFixed(1)}% (${(signal.price * 100).toFixed(1)}c → ${(executionPrice * 100).toFixed(1)}c)`,
+            details: { cycleId, conditionId: signal.conditionId, signalPrice: signal.price, freshPrice: executionPrice },
+            timestamp: Date.now(),
+            cycleId,
+          });
+          continue;
+        }
+
+        const tradeCost = finalSize * executionPrice;
 
         if (tradeCost > cycleBalance) {
           await ctx.runMutation(internal.trackedTraders.internalUpdateSignalStatus, {
@@ -862,7 +881,7 @@ export const runCopyTradeCycle = internalAction({
             await polyClient.createAndPostOrder(
               {
                 tokenID: signal.tokenId,
-                price: signal.price,
+                price: executionPrice,
                 size: finalSize,
                 side: Side.BUY,
               },
@@ -881,7 +900,8 @@ export const runCopyTradeCycle = internalAction({
           }
         }
 
-        // Record the trade
+        // Record the trade at the actual execution price
+        console.log(`[COPY TRADE] ✓ ${config.dryRun ? "[DRY]" : "[LIVE]"} ${signal.side} "${signal.question.slice(0, 50)}" | $${finalSize.toFixed(2)} @ ${(executionPrice * 100).toFixed(1)}c | trader: ${signal.traderUsername}`);
         const status: "dry_run" | "pending" = config.dryRun ? "dry_run" : "pending";
         await ctx.runMutation(internal.trades.internalRecordTrade, {
           conditionId: signal.conditionId,
@@ -889,24 +909,23 @@ export const runCopyTradeCycle = internalAction({
           tokenId: signal.tokenId,
           side: signal.side,
           size: finalSize,
-          price: signal.price,
+          price: executionPrice,
           confidence: validation.confidence ?? 0.7,
-          reasoning: `[COPY TRADE] ${signal.reasoning} | LLM: ${validation.reasoning ?? "approved"}`,
+          reasoning: `[COPY] ${signal.reasoning} | ${validation.reasoning ?? "approved"}`,
           status,
           executedAt: Date.now(),
         });
 
-        // Open position
+        // Open position at execution price
         const positionSide: "yes" | "no" = signal.side === "buy_yes" ? "yes" : "no";
-        // Calculate TP/SL prices (default: 12% take profit, 10% stop loss)
         const tpPct = 0.12;
         const slPct = 0.10;
         const takeProfitPrice = positionSide === "yes"
-          ? signal.price * (1 + tpPct)
-          : signal.price * (1 - tpPct);
+          ? executionPrice * (1 + tpPct)
+          : executionPrice * (1 - tpPct);
         const stopLossPrice = positionSide === "yes"
-          ? signal.price * (1 - slPct)
-          : signal.price * (1 + slPct);
+          ? executionPrice * (1 - slPct)
+          : executionPrice * (1 + slPct);
 
         await ctx.runMutation(internal.positions.internalOpenPosition, {
           conditionId: signal.conditionId,
@@ -914,8 +933,8 @@ export const runCopyTradeCycle = internalAction({
           tokenId: signal.tokenId,
           side: positionSide,
           size: finalSize,
-          avgEntryPrice: signal.price,
-          currentPrice: signal.price,
+          avgEntryPrice: executionPrice,
+          currentPrice: executionPrice,
           unrealizedPnl: 0,
           openedAt: Date.now(),
           takeProfitPrice: Math.round(takeProfitPrice * 1000) / 1000,
@@ -935,7 +954,7 @@ export const runCopyTradeCycle = internalAction({
           question: signal.question,
           side: signal.side,
           copySize: finalSize,
-          copyPrice: signal.price,
+          copyPrice: executionPrice,
         });
         await ctx.runMutation(internal.trackedTraders.internalIncrementCopyCount, {
           address: signal.traderAddress,
@@ -943,6 +962,9 @@ export const runCopyTradeCycle = internalAction({
 
         executedCount++;
       }
+
+      console.log(`[COPY TRADE] Cycle complete: ${executedCount}/${signals.length} executed | balance: $${cycleBalance.toFixed(2)}`);
+      console.log(`${"=".repeat(60)}\n`);
 
       await ctx.runMutation(internal.agentActions.internalLogAction, {
         type: "copy_trade_execute",
@@ -998,6 +1020,15 @@ export const runCopyTradeCycle = internalAction({
         timestamp: Date.now(),
         cycleId,
       });
+    }
+
+    // 24/7 mode: re-schedule immediately with a 30s cooldown
+    const continuousEntry = await ctx.runQuery(
+      internal.config.internalGetConfig,
+      { key: "copyTrade247" }
+    );
+    if (continuousEntry?.value === "true") {
+      await ctx.scheduler.runAfter(30_000, internal.agentRun.runCopyTradeCycle);
     }
   },
 });

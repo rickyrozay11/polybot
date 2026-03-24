@@ -20,6 +20,8 @@ const configFields: ConfigField[] = [
   { key: "modelId", label: "Model ID", type: "text", description: "OpenAI model to use for research" },
   { key: "runIntervalMinutes", label: "Run Interval (min)", type: "number", description: "Minutes between bot cycles" },
   { key: "enabled", label: "Bot Enabled", type: "toggle", description: "Enable or disable the trading bot" },
+  { key: "copyTradeOnly", label: "Copy Trade Only", type: "toggle", description: "Only run copy-trading — disable autonomous research trading" },
+  { key: "copyTrade247", label: "Copy Trade 24/7", type: "toggle", description: "Continuous scanning — re-runs every 30s instead of every 3 min" },
   { key: "dryRun", label: "Dry Run Mode", type: "toggle", description: "Simulate trades without execution" },
 ];
 
