@@ -109,6 +109,9 @@ export const internalOpenPosition = internalMutation({
     unrealizedPnl: v.float64(),
     openedAt: v.float64(),
     slug: v.optional(v.string()),
+    takeProfitPrice: v.optional(v.float64()),
+    stopLossPrice: v.optional(v.float64()),
+    copiedFrom: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     return await ctx.db.insert("positions", {
@@ -123,6 +126,21 @@ export const internalUpdatePositionPrice = internalMutation({
     positionId: v.id("positions"),
     currentPrice: v.float64(),
     unrealizedPnl: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    const { positionId, ...fields } = args;
+    await ctx.db.patch(positionId, fields);
+  },
+});
+
+export const internalClosePosition = internalMutation({
+  args: {
+    positionId: v.id("positions"),
+    status: v.union(v.literal("closed"), v.literal("resolved")),
+    currentPrice: v.float64(),
+    unrealizedPnl: v.float64(),
+    closedAt: v.float64(),
+    exitReason: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const { positionId, ...fields } = args;

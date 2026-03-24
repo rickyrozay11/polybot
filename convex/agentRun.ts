@@ -450,7 +450,7 @@ export const runCopyTradeCycle = internalAction({
     });
 
     try {
-      const { discoverTopTraders, scanTraderActivity, generateCopySignals, buildCopyTradeValidationPrompt, shouldDisableTrader } =
+      const { discoverTopTraders, scanTraderActivity, generateCopySignals, buildCopyTradeValidationPrompt, shouldDisableTrader, detectCopyExits } =
         await import("../src/agent/copy-trader");
       const { OpenRouterProvider } = await import("../src/llm/openrouter");
       const { SYSTEM_PROMPT } = await import("../src/agent/prompts");
@@ -600,9 +600,58 @@ export const runCopyTradeCycle = internalAction({
         }
       }
 
-      // Step 3: Generate consensus signals
+      // Step 2.5: Detect trader exits — if top traders are selling positions we hold, exit too
       const openPositions = await ctx.runQuery(internal.positions.internalOpenPositions, {});
       const existingPositionIds = openPositions.map((p: any) => p.conditionId);
+
+      const copyExits = detectCopyExits(detections, existingPositionIds);
+      for (const exit of copyExits) {
+        const position = openPositions.find((p: any) => p.conditionId === exit.conditionId);
+        if (!position) continue;
+
+        // Fetch current price for the exit
+        try {
+          const res = await fetch(`https://clob.polymarket.com/midpoint?token_id=${position.tokenId}`);
+          if (!res.ok) continue;
+          const data = (await res.json()) as { mid: string };
+          const currentPrice = parseFloat(data.mid);
+          if (isNaN(currentPrice)) continue;
+
+          const unrealizedPnl = (currentPrice - position.avgEntryPrice) * position.size *
+            (position.side === "yes" ? 1 : -1);
+
+          await ctx.runMutation(internal.positions.internalClosePosition, {
+            positionId: position._id,
+            status: "closed",
+            currentPrice,
+            unrealizedPnl,
+            closedAt: Date.now(),
+            exitReason: `copy_exit:${exit.traderUsername}`,
+          });
+
+          // Credit wallet
+          const exitValue = currentPrice * position.size;
+          await ctx.runMutation(internal.wallet.internalCreditFromExit, { amount: exitValue });
+
+          // Close copy performance record
+          await ctx.runMutation(internal.trackedTraders.internalCloseCopyResult, {
+            conditionId: exit.conditionId,
+            exitPrice: currentPrice,
+          });
+
+          await ctx.runMutation(internal.agentActions.internalLogAction, {
+            type: "copy_exit",
+            summary: `Copy-exit: ${exit.reason} — PnL: $${unrealizedPnl.toFixed(2)}`,
+            details: { cycleId, ...exit, pnl: unrealizedPnl, exitPrice: currentPrice },
+            timestamp: Date.now(),
+            cycleId,
+          });
+        } catch {
+          // Non-critical, skip this exit
+        }
+      }
+
+      // Step 3: Generate consensus signals
 
       const signals = await generateCopySignals(detections, config, existingPositionIds);
 
@@ -844,6 +893,16 @@ export const runCopyTradeCycle = internalAction({
 
         // Open position
         const positionSide: "yes" | "no" = signal.side === "buy_yes" ? "yes" : "no";
+        // Calculate TP/SL prices (default: 12% take profit, 10% stop loss)
+        const tpPct = 0.12;
+        const slPct = 0.10;
+        const takeProfitPrice = positionSide === "yes"
+          ? signal.price * (1 + tpPct)
+          : signal.price * (1 - tpPct);
+        const stopLossPrice = positionSide === "yes"
+          ? signal.price * (1 - slPct)
+          : signal.price * (1 + slPct);
+
         await ctx.runMutation(internal.positions.internalOpenPosition, {
           conditionId: signal.conditionId,
           question: signal.question,
@@ -854,6 +913,9 @@ export const runCopyTradeCycle = internalAction({
           currentPrice: signal.price,
           unrealizedPnl: 0,
           openedAt: Date.now(),
+          takeProfitPrice: Math.round(takeProfitPrice * 1000) / 1000,
+          stopLossPrice: Math.round(stopLossPrice * 1000) / 1000,
+          copiedFrom: signal.traderAddress,
         });
 
         await ctx.runMutation(internal.trackedTraders.internalUpdateSignalStatus, {
@@ -998,6 +1060,8 @@ export const refreshPositions = internalAction({
       {}
     );
 
+    let exitCount = 0;
+
     for (const position of openPositions) {
       try {
         // Fetch current price from Polymarket API
@@ -1015,6 +1079,80 @@ export const refreshPositions = internalAction({
           position.size *
           (position.side === "yes" ? 1 : -1);
 
+        // --- Auto-exit: take profit / stop loss ---
+        const pos = position as any;
+        const takeProfitPrice = pos.takeProfitPrice as number | undefined;
+        const stopLossPrice = pos.stopLossPrice as number | undefined;
+        let exitReason: string | null = null;
+
+        if (takeProfitPrice && position.side === "yes" && currentPrice >= takeProfitPrice) {
+          exitReason = `take_profit_hit_${(currentPrice * 100).toFixed(1)}pct`;
+        } else if (takeProfitPrice && position.side === "no" && currentPrice <= takeProfitPrice) {
+          exitReason = `take_profit_hit_${(currentPrice * 100).toFixed(1)}pct`;
+        } else if (stopLossPrice && position.side === "yes" && currentPrice <= stopLossPrice) {
+          exitReason = `stop_loss_hit_${(currentPrice * 100).toFixed(1)}pct`;
+        } else if (stopLossPrice && position.side === "no" && currentPrice >= stopLossPrice) {
+          exitReason = `stop_loss_hit_${(currentPrice * 100).toFixed(1)}pct`;
+        }
+
+        // Also exit if position has been open > 3 days (time stop)
+        const holdTimeMs = Date.now() - position.openedAt;
+        const maxHoldMs = 3 * 24 * 60 * 60 * 1000;
+        if (!exitReason && holdTimeMs > maxHoldMs) {
+          exitReason = `time_stop_${(holdTimeMs / (60 * 60 * 1000)).toFixed(0)}hrs`;
+        }
+
+        if (exitReason) {
+          // Close the position
+          await ctx.runMutation(internal.positions.internalClosePosition, {
+            positionId: position._id,
+            status: "closed",
+            currentPrice,
+            unrealizedPnl,
+            closedAt: Date.now(),
+            exitReason,
+          });
+
+          // Credit wallet back (entry cost + P&L)
+          const exitValue = currentPrice * position.size;
+          await ctx.runMutation(internal.wallet.internalCreditFromExit, {
+            amount: exitValue,
+          });
+
+          // Close copy-trade performance record if applicable
+          if (pos.copiedFrom) {
+            try {
+              const { internalCloseCopyResult } = await import("./trackedTraders");
+              // This is handled via the existing internalCloseCopyResult mutation
+              await ctx.runMutation(internal.trackedTraders.internalCloseCopyResult, {
+                conditionId: position.conditionId,
+                exitPrice: currentPrice,
+              });
+            } catch {
+              // Non-critical
+            }
+          }
+
+          await ctx.runMutation(internal.agentActions.internalLogAction, {
+            type: "auto_exit",
+            summary: `Auto-exit: ${exitReason} on "${position.question}" — PnL: $${unrealizedPnl.toFixed(2)}`,
+            details: {
+              conditionId: position.conditionId,
+              side: position.side,
+              entryPrice: position.avgEntryPrice,
+              exitPrice: currentPrice,
+              pnl: unrealizedPnl,
+              exitReason,
+              holdTimeHours: Math.round(holdTimeMs / (60 * 60 * 1000)),
+            },
+            timestamp: Date.now(),
+          });
+
+          exitCount++;
+          continue;
+        }
+
+        // Just update price if no exit triggered
         await ctx.runMutation(
           internal.positions.internalUpdatePositionPrice,
           {
@@ -1028,10 +1166,14 @@ export const refreshPositions = internalAction({
       }
     }
 
+    const summary = exitCount > 0
+      ? `Refreshed ${openPositions.length} positions, auto-exited ${exitCount}`
+      : `Refreshed ${openPositions.length} open positions`;
+
     await ctx.runMutation(internal.agentActions.internalLogAction, {
       type: "position_refresh",
-      summary: `Refreshed ${openPositions.length} open positions`,
-      details: { count: openPositions.length },
+      summary,
+      details: { count: openPositions.length, exitCount },
       timestamp: Date.now(),
     });
 

@@ -11,6 +11,8 @@ const logActionArgs = {
     v.literal("position_refresh"),
     v.literal("copy_trade_scan"),
     v.literal("copy_trade_execute"),
+    v.literal("copy_exit"),
+    v.literal("auto_exit"),
     v.literal("whale_alert"),
     v.literal("convergence_signal"),
     v.literal("ensemble_vote"),

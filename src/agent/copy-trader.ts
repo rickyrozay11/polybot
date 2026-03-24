@@ -593,3 +593,50 @@ export function shouldDisableTrader(trader: TrackedTrader): string | null {
 
   return null;
 }
+
+// ---- Copy Exit Detection ----
+
+/**
+ * Detect when tracked traders are SELLING positions that we also hold.
+ * If a top trader exits, we should consider exiting too.
+ */
+export function detectCopyExits(
+  detections: NewTradeDetection[],
+  ourPositionConditionIds: string[]
+): Array<{
+  conditionId: string;
+  question: string;
+  traderAddress: string;
+  traderUsername: string;
+  traderScore: number;
+  reason: string;
+}> {
+  const exits: Array<{
+    conditionId: string;
+    question: string;
+    traderAddress: string;
+    traderUsername: string;
+    traderScore: number;
+    reason: string;
+  }> = [];
+
+  const positionSet = new Set(ourPositionConditionIds);
+
+  for (const detection of detections) {
+    for (const trade of detection.trades) {
+      // Look for SELL trades on markets we hold positions in
+      if (trade.side === "SELL" && positionSet.has(trade.conditionId)) {
+        exits.push({
+          conditionId: trade.conditionId,
+          question: trade.title ?? trade.conditionId,
+          traderAddress: detection.traderAddress,
+          traderUsername: detection.traderUsername,
+          traderScore: detection.traderScore,
+          reason: `${detection.traderUsername} (score: ${detection.traderScore.toFixed(2)}) sold $${parseFloat(trade.size).toFixed(2)} at ${(parseFloat(trade.price) * 100).toFixed(1)}%`,
+        });
+      }
+    }
+  }
+
+  return exits;
+}

@@ -116,6 +116,22 @@ export const internalCreditForClose = internalMutation({
   },
 });
 
+export const internalCreditFromExit = internalMutation({
+  args: {
+    amount: v.float64(),
+  },
+  handler: async (ctx, args) => {
+    const wallets = await ctx.db.query("wallet").collect();
+    if (wallets.length === 0) return;
+
+    const wallet = wallets[0];
+    await ctx.db.patch(wallet._id, {
+      balance: Math.round((wallet.balance + args.amount) * 100) / 100,
+      updatedAt: Date.now(),
+    });
+  },
+});
+
 // Recalculate totalInvested from open positions (self-healing)
 export const internalReconcileWallet = internalMutation({
   args: {

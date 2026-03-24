@@ -41,6 +41,12 @@ export default defineSchema({
     openedAt: v.float64(),
     closedAt: v.optional(v.float64()),
     slug: v.optional(v.string()),
+    // Auto-exit targets
+    takeProfitPrice: v.optional(v.float64()),
+    stopLossPrice: v.optional(v.float64()),
+    exitReason: v.optional(v.string()),
+    // Copy-trade attribution
+    copiedFrom: v.optional(v.string()),
   })
     .index("by_status", ["status"])
     .index("by_conditionId", ["conditionId"]),
@@ -137,6 +143,8 @@ export default defineSchema({
       v.literal("position_refresh"),
       v.literal("copy_trade_scan"),
       v.literal("copy_trade_execute"),
+      v.literal("copy_exit"),
+      v.literal("auto_exit"),
       v.literal("whale_alert"),
       v.literal("convergence_signal"),
       v.literal("ensemble_vote"),

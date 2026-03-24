@@ -101,6 +101,8 @@ export type AgentActionType =
   | "position_refresh"
   | "copy_trade_scan"
   | "copy_trade_execute"
+  | "copy_exit"
+  | "auto_exit"
   | "whale_alert"
   | "convergence_signal"
   | "ensemble_vote"
@@ -167,6 +169,15 @@ export interface CopyTradeSignal {
   price: number;
   consensus: number; // 0-1 how many tracked traders agree
   reasoning: string;
+}
+
+export interface CopyExitSignal {
+  conditionId: string;
+  question: string;
+  traderAddress: string;
+  traderUsername: string;
+  traderScore: number;
+  reason: string;
 }
 
 export interface AgentAction {
